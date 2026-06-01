@@ -1,0 +1,27 @@
+# Build outputs
+/build/
+*.o
+*.so
+*.a
+
+# Python cache / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+config
+client_secret*.json
+oauth-token*.json
+*.secret
+*.key
+
+# Logs / editor files
+*.log
+*.tmp
+*~
+.DS_Store

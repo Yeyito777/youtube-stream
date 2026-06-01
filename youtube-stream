@@ -1,0 +1,880 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROGRAM=${0##*/}
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/youtube-stream"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/youtube-stream"
+
+# quickrec-compatible defaults:
+DEFAULT_FPS=30
+DEFAULT_MIC_GAIN=7.875
+DEFAULT_SYSTEM_GAIN=0.675
+DEFAULT_AUDIO_BITRATE=192k
+DEFAULT_VIDEO_BITRATE_KBPS=6800
+DEFAULT_MIC_SOURCE=default_input
+DEFAULT_SYSTEM_SOURCE=default_output
+
+START_BROWSER=1
+START_OUTLINE=1
+START_AUDIO=1
+DRY_RUN=0
+SETUP_ONLY=0
+TITLE=""
+DESCRIPTION=""
+THUMBNAIL=""
+PRIVACY=""
+STREAM_WATCH_URL=""
+
+usage() {
+    cat <<'EOF'
+Usage: youtube-stream [options]
+
+Set YouTube title/description/thumbnail through the YouTube Data API, draw a
+purple outline around the primary monitor, and stream that monitor to YouTube
+over RTMP until Ctrl+C.
+
+Options:
+  -t, --title TITLE       Stream title (required to stream)
+  -d, --description TEXT  Stream description (required to stream)
+  -p, --thumbnail PATH    Stream thumbnail image, PNG/JPEG (required to stream)
+  -v, --privacy STATUS    Stream privacy: public, unlisted, or private
+  --setup            Configure stream key, then exit
+  --no-browser       Do not open the public stream page in vimbrowser
+  --no-outline       Do not draw the purple primary-monitor outline
+  --no-audio         Stream video only
+  --dry-run          Print the command pipeline without starting it
+  -h, --help         Show this help
+
+Config file:
+  ~/.config/youtube-stream/config
+
+Common config/env values:
+  YOUTUBE_STREAM_KEY=xxxx-xxxx-xxxx-xxxx-xxxx
+  YOUTUBE_STREAM_URL=rtmp://a.rtmp.youtube.com/live2/xxxx-xxxx...
+  YOUTUBE_STREAM_CHANNEL_ID=UC...
+  YOUTUBE_STREAM_TITLE='My stream title'
+  YOUTUBE_STREAM_DESCRIPTION='My stream description'
+  YOUTUBE_STREAM_THUMBNAIL=/path/to/thumbnail.png
+  YOUTUBE_STREAM_PRIVACY=public
+  YOUTUBE_STREAM_FPS=30
+  YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
+  YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
+  YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
+  YOUTUBE_STREAM_MIC_GAIN=7.875
+  YOUTUBE_STREAM_SYSTEM_GAIN=0.675
+
+Notes:
+  - Audio defaults mirror quickrec's intent: mic + system audio mixed with
+    quickrec's default gains (mic 7.875, system 0.675) and AAC 192k.
+  - Capture/encoding uses gpu-screen-recorder and the GPU. ffmpeg only muxes
+    the already-encoded video with the live mixed audio and pushes FLV/RTMP.
+EOF
+}
+
+log() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+warn() { printf '%s: warning: %s\n' "$PROGRAM" "$*" >&2; }
+die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+shell_quote() {
+    printf '%q' "$1"
+}
+
+redact_url() {
+    local value=$1
+    if [[ $value =~ ^(rtmps?://.*/)([^/?#]+)(.*)$ ]]; then
+        printf '%s<stream-key-redacted>%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}"
+    else
+        printf '<stream-url-redacted>'
+    fi
+}
+
+while (($#)); do
+    case "$1" in
+        -t|--title)
+            (($# >= 2)) || die "--title requires an argument"
+            TITLE=$2
+            shift 2
+            ;;
+        --title=*)
+            TITLE=${1#--title=}
+            shift
+            ;;
+        -d|--description)
+            (($# >= 2)) || die "--description requires an argument"
+            DESCRIPTION=$2
+            shift 2
+            ;;
+        --description=*)
+            DESCRIPTION=${1#--description=}
+            shift
+            ;;
+        -p|--thumbnail)
+            (($# >= 2)) || die "--thumbnail requires an argument"
+            THUMBNAIL=$2
+            shift 2
+            ;;
+        --thumbnail=*)
+            THUMBNAIL=${1#--thumbnail=}
+            shift
+            ;;
+        -v|--privacy)
+            (($# >= 2)) || die "--privacy requires an argument"
+            PRIVACY=$2
+            shift 2
+            ;;
+        --privacy=*)
+            PRIVACY=${1#--privacy=}
+            shift
+            ;;
+        --setup)
+            SETUP_ONLY=1
+            shift
+            ;;
+        --no-browser)
+            START_BROWSER=0
+            shift
+            ;;
+        --no-outline)
+            START_OUTLINE=0
+            shift
+            ;;
+        --no-audio)
+            START_AUDIO=0
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            die "unknown option: $1"
+            ;;
+        *)
+            [[ -z $TITLE ]] || die "unexpected extra argument: $1"
+            TITLE=$1
+            shift
+            ;;
+    esac
+done
+
+if [[ -f $CONFIG_FILE ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+TITLE=${TITLE:-${YOUTUBE_STREAM_TITLE:-}}
+DESCRIPTION=${DESCRIPTION:-${YOUTUBE_STREAM_DESCRIPTION:-}}
+THUMBNAIL=${THUMBNAIL:-${YOUTUBE_STREAM_THUMBNAIL:-}}
+PRIVACY=${PRIVACY:-${YOUTUBE_STREAM_PRIVACY:-}}
+
+require_command() {
+    have "$1" || die "missing dependency: $1"
+}
+
+check_dependencies() {
+    require_command gpu-screen-recorder
+    require_command ffmpeg
+    require_command xrandr
+    require_command python3
+    find_api_helper >/dev/null || die "youtube-stream API helper not found; run 'make install'"
+    if ((START_BROWSER)); then
+        if ! find_vimbrowser_cli >/dev/null; then
+            if ((DRY_RUN)); then
+                warn "vimbrowser-cli not found; public stream page would not be opened"
+            else
+                warn "vimbrowser-cli not found; public stream page will not be opened"
+            fi
+        fi
+    fi
+    if ((START_OUTLINE)); then
+        find_outline_helper >/dev/null || warn "outline helper not found; run 'make install' or run from the source tree after 'make'"
+    fi
+}
+
+validate_stream_metadata() {
+    if [[ -z $TITLE ]]; then
+        die "missing stream title; pass -t/--title or set YOUTUBE_STREAM_TITLE in $CONFIG_FILE"
+    fi
+    if [[ -z $DESCRIPTION ]]; then
+        die "missing stream description; pass -d/--description or set YOUTUBE_STREAM_DESCRIPTION in $CONFIG_FILE"
+    fi
+    if [[ -z $THUMBNAIL ]]; then
+        die "missing stream thumbnail; pass -p/--thumbnail or set YOUTUBE_STREAM_THUMBNAIL in $CONFIG_FILE"
+    fi
+    if [[ ! -f $THUMBNAIL ]]; then
+        die "thumbnail file does not exist: $THUMBNAIL"
+    fi
+    case ${THUMBNAIL,,} in
+        *.png|*.jpg|*.jpeg) ;;
+        *) die "thumbnail must be a PNG or JPEG file: $THUMBNAIL" ;;
+    esac
+    THUMBNAIL=$(readlink -f -- "$THUMBNAIL") || die "could not resolve thumbnail path: $THUMBNAIL"
+
+    if [[ -n $PRIVACY ]]; then
+        PRIVACY=${PRIVACY,,}
+        case $PRIVACY in
+            public|unlisted|private) ;;
+            *) die "invalid privacy '$PRIVACY'; use public, unlisted, or private" ;;
+        esac
+    fi
+}
+
+# Convert quickrec/gpu-screen-recorder-style defaults to ffmpeg PulseAudio names.
+to_pulse_source() {
+    case "$1" in
+        default_input) printf '@DEFAULT_SOURCE@' ;;
+        default_output) printf '@DEFAULT_MONITOR@' ;;
+        device:*) printf '%s' "${1#device:}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+get_config_value_from_env_or_quickrec() {
+    local youtube_name=$1 quickrec_name=$2 default_value=$3 value=""
+    value=${!youtube_name-}
+    if [[ -z $value && -n $quickrec_name ]]; then
+        value=${!quickrec_name-}
+    fi
+    if [[ -z $value ]]; then
+        value=$default_value
+    fi
+    printf '%s\n' "$value"
+}
+
+get_primary_monitor() {
+    local line first_name="" first_geo=""
+    local name geo
+
+    while IFS= read -r line; do
+        if [[ $line =~ ^([^[:space:]]+)[[:space:]]+connected([[:space:]]+primary)?[[:space:]]+([0-9]+x[0-9]+[-+][0-9]+[-+][0-9]+) ]]; then
+            name=${BASH_REMATCH[1]}
+            geo=${BASH_REMATCH[3]}
+            if [[ -z $first_name ]]; then
+                first_name=$name
+                first_geo=$geo
+            fi
+            if [[ ${BASH_REMATCH[2]} == *primary* ]]; then
+                printf '%s %s\n' "$name" "$geo"
+                return 0
+            fi
+        fi
+    done < <(xrandr --query)
+
+    if [[ -n $first_name ]]; then
+        printf '%s %s\n' "$first_name" "$first_geo"
+        return 0
+    fi
+
+    return 1
+}
+
+find_outline_helper() {
+    local script_dir helper
+    script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+    for helper in \
+        "${YOUTUBE_STREAM_OUTLINE_HELPER:-}" \
+        "$script_dir/build/youtube-stream-outline" \
+        "$script_dir/youtube-stream-outline" \
+        "$HOME/.local/lib/youtube-stream/youtube-stream-outline"; do
+        if [[ -n $helper && -x $helper ]]; then
+            printf '%s\n' "$helper"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_api_helper() {
+    local script_dir helper
+    script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+    for helper in \
+        "${YOUTUBE_STREAM_API_HELPER:-}" \
+        "$script_dir/youtube-stream-api" \
+        "$HOME/.local/lib/youtube-stream/youtube-stream-api"; do
+        if [[ -n $helper && -x $helper ]]; then
+            printf '%s\n' "$helper"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_vimbrowser_cli() {
+    local candidate
+
+    for candidate in \
+        "${VIMBROWSER_CLI:-}" \
+        vimbrowser-cli \
+        "$HOME/Workspace/exocortex/external-tools/vimbrowser-cli/bin/vimbrowser-cli" \
+        "$HOME/Workspace/Exocortex/external-tools/vimbrowser-cli/bin/vimbrowser-cli"; do
+        [[ -n $candidate ]] || continue
+        if [[ $candidate == */* ]]; then
+            if [[ -x $candidate ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        elif command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+json_string() {
+    if have python3; then
+        python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
+    else
+        # Minimal fallback: enough for ordinary stream titles.
+        local s=${1//\\/\\\\}
+        s=${s//"/\\"}
+        s=${s//$'\n'/\\n}
+        printf '"%s"\n' "$s"
+    fi
+}
+
+json_number_field() {
+    local json=$1 field=$2
+    if have python3; then
+        python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.argv[2], ""))' "$json" "$field" 2>/dev/null || true
+    else
+        local rest=${json#*"$field":}
+        [[ $rest != "$json" ]] || return 0
+        rest=${rest%%,*}
+        rest=${rest%%\}*}
+        rest=${rest//[!0-9]/}
+        printf '%s\n' "$rest"
+    fi
+}
+
+json_string_field() {
+    local json=$1 field=$2
+    have python3 || return 0
+    python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.argv[2], ""))' "$json" "$field" 2>/dev/null || true
+}
+
+make_thumbnail_upload_js() {
+    local thumbnail=$1 out
+    have python3 || die "python3 is required to upload the thumbnail through vimbrowser"
+    out=$(mktemp --suffix=.youtube-stream-thumbnail.js)
+    python3 - "$thumbnail" >"$out" <<'PY'
+import base64
+import json
+import mimetypes
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+mime = mimetypes.guess_type(path.name)[0] or "image/png"
+data = base64.b64encode(path.read_bytes()).decode("ascii")
+
+print(f"""
+(() => {{
+  const b64 = {json.dumps(data)};
+  const filename = {json.dumps(path.name)};
+  const mime = {json.dumps(mime)};
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const file = new File([bytes], filename, {{type: mime, lastModified: Date.now()}});
+  const root = document.querySelector('ytls-broadcast-edit-dialog') || document;
+  const input = root.querySelector('input[type=file]#file-loader')
+             || root.querySelector('input[type=file][accept*=png]')
+             || document.querySelector('ytls-broadcast-edit-dialog input[type=file]')
+             || document.querySelector('input[type=file]#file-loader');
+  if (!input) return 'thumbnail-upload-failed:no-file-input';
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  input.files = dt.files;
+  input.dispatchEvent(new Event('input', {{bubbles:true, composed:true}}));
+  input.dispatchEvent(new Event('change', {{bubbles:true, composed:true}}));
+  return 'thumbnail-upload-ok:' + input.id + ':' + input.files[0]?.name + ':' + input.files[0]?.size;
+}})()
+""")
+PY
+    printf '%s\n' "$out"
+}
+
+discover_channel_id_with_vimbrowser() {
+    local vcli=${1:-} url channel wait_secs
+    wait_secs=${YOUTUBE_STREAM_BROWSER_WAIT:-5}
+    [[ -n $vcli ]] || vcli=$(find_vimbrowser_cli) || return 1
+
+    url=$("$vcli" url 2>/dev/null || true)
+    if [[ $url =~ studio\.youtube\.com/channel/([^/?#]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    "$vcli" open 'https://studio.youtube.com/' >/dev/null 2>&1 || return 1
+    sleep "$wait_secs"
+    url=$("$vcli" url 2>/dev/null || true)
+    if [[ $url =~ studio\.youtube\.com/channel/([^/?#]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+append_config_if_missing() {
+    local key=$1 value=$2
+    umask 077
+    mkdir -p "$CONFIG_DIR"
+    touch "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    if ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" "$CONFIG_FILE" 2>/dev/null; then
+        printf '%s=%s\n' "$key" "$(shell_quote "$value")" >>"$CONFIG_FILE"
+	fi
+}
+
+apply_youtube_metadata_api() {
+    local title=$1 description=$2 thumbnail=$3 privacy=$4 helper result watch_url vcli
+    local -a api_args
+
+    helper=$(find_api_helper) || die "youtube-stream API helper not found; run 'make install'"
+    api_args=(
+        update
+        --title "$title"
+        --description "$description"
+        --thumbnail "$thumbnail"
+    )
+    [[ -n $privacy ]] && api_args+=(--privacy "$privacy")
+    result=$("$helper" "${api_args[@]}") || die "failed to update YouTube stream metadata through API"
+
+    watch_url=$(json_string_field "$result" watch_url)
+    STREAM_WATCH_URL=$watch_url
+    log "updated YouTube stream metadata through API"
+
+    if [[ -n $watch_url ]]; then
+        printf '%s\n' "$watch_url" >"$STATE_DIR/current-watch-url" 2>/dev/null || true
+        log "stream page: $watch_url"
+        if ((START_BROWSER)); then
+            vcli=$(find_vimbrowser_cli || true)
+            if [[ -n $vcli ]]; then
+                log "opening public stream page in vimbrowser"
+                "$vcli" open "$watch_url" >/dev/null 2>&1 || warn "failed to open public stream page: $watch_url"
+            fi
+        fi
+    fi
+}
+
+prepare_youtube_live() {
+    local title=$1 description=$2 thumbnail=$3 channel_id=${YOUTUBE_STREAM_CHANNEL_ID:-} url js_title js_description js_result page_text vcli
+    local open_response tab
+    local thumb_js thumb_result save_result final_url watch_url
+
+    if (( ! START_BROWSER )); then
+        return 0
+    fi
+    vcli=$(find_vimbrowser_cli) || die "vimbrowser-cli not found; cannot apply required YouTube Studio title/description/thumbnail"
+
+    if [[ -z $channel_id ]]; then
+        channel_id=$(discover_channel_id_with_vimbrowser "$vcli" || true)
+        if [[ -n $channel_id ]]; then
+            append_config_if_missing YOUTUBE_STREAM_CHANNEL_ID "$channel_id"
+        fi
+    fi
+
+    if [[ -n $channel_id ]]; then
+        url="https://studio.youtube.com/channel/${channel_id}/livestreaming"
+    else
+        url='https://studio.youtube.com/'
+    fi
+
+    log "opening YouTube Studio Live Control Room in vimbrowser"
+    open_response=$("$vcli" open "$url" 2>/dev/null) || {
+        warn "failed to open $url in vimbrowser"
+        return 0
+    }
+    tab=$(json_number_field "$open_response" active_tabid)
+    [[ -n $tab ]] || tab=@active
+
+    sleep "${YOUTUBE_STREAM_BROWSER_WAIT:-5}"
+
+    # Best effort: open the Live Control Room metadata editor, set the title,
+    # clear/update the description, and save.  The RTMP stream itself still
+    # starts separately; this does not click Go Live / End Stream / Create.
+    js_title=$(json_string "$title")
+    js_description=$(json_string "$description")
+
+    "$vcli" js "$tab" "(() => {
+      const edit = document.querySelector('ytls-stream-settings-widget-renderer ytls-broadcast-metadata ytcp-button#edit-button button')
+                || document.querySelector('ytls-stream-settings-widget-renderer ytcp-button#edit-button button')
+                || document.querySelector('ytls-broadcast-metadata ytcp-button#edit-button button');
+      if (edit) edit.click();
+      return JSON.stringify({clicked: !!edit, url: location.href});
+    })()" >/dev/null 2>&1 || true
+
+    sleep "${YOUTUBE_STREAM_EDITOR_WAIT:-2}"
+
+    js_result=$("$vcli" js "$tab" "(() => {
+      const wantedTitle = ${js_title};
+      const wantedDescription = ${js_description};
+      const setNativeValue = (el, value) => {
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+        el.dispatchEvent(new InputEvent('input', {bubbles: true, composed: true, inputType: 'insertText', data: value}));
+        el.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+      };
+      const setContentEditable = (el, value) => {
+        el.focus();
+        el.textContent = value;
+        el.dispatchEvent(new InputEvent('input', {bubbles: true, composed: true, inputType: 'insertText', data: value}));
+        el.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+        el.blur();
+      };
+      const setField = (el, value) => {
+        if (!el) return false;
+        if (el.isContentEditable) setContentEditable(el, value);
+        else setNativeValue(el, value);
+        return true;
+      };
+      const root = document.querySelector('ytls-broadcast-edit-dialog') || document;
+      const fields = Array.from(root.querySelectorAll('input, textarea, [contenteditable="true"]'));
+      const titleEl = fields.find(el => /t[ií]tulo|title/i.test([
+        el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.name, el.id,
+        el.closest('ytcp-form-input-container, ytcp-video-metadata-editor-basics, div')?.innerText
+      ].filter(Boolean).join(' ')));
+      const descEl = fields.find(el => /cuenta a los usuarios|descripci[oó]n|description/i.test([
+        el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.name, el.id,
+        el.closest('ytcp-form-input-container, ytcp-video-metadata-editor-basics, div')?.innerText
+      ].filter(Boolean).join(' ')));
+      const titleFilled = setField(titleEl, wantedTitle);
+      const descriptionFilled = setField(descEl, wantedDescription);
+      const save = root.querySelector('#save-button button') || root.querySelector('ytcp-button#save-button button');
+      const saveEnabled = !!save && save.getAttribute('aria-disabled') !== 'true' && !save.disabled;
+      let status = titleFilled ? 'metadata-filled' : 'opened';
+      return JSON.stringify({status, titleFilled, descriptionFilled, saveEnabled, url: location.href});
+    })()" 2>/dev/null || true)
+
+    if [[ $js_result == *metadata-filled* ]]; then
+        log "filled YouTube Studio stream title/description"
+    else
+        die "could not find YouTube Studio metadata editor fields; refusing to start stream"
+    fi
+
+    thumb_js=$(make_thumbnail_upload_js "$thumbnail")
+    thumb_result=$("$vcli" js-file "$tab" "$thumb_js" 2>/dev/null || true)
+    rm -f "$thumb_js"
+    if [[ $thumb_result == *thumbnail-upload-ok* ]]; then
+        log "uploaded YouTube Studio stream thumbnail"
+    else
+        die "could not upload stream thumbnail in YouTube Studio; refusing to start stream"
+    fi
+
+    sleep "${YOUTUBE_STREAM_THUMBNAIL_WAIT:-2}"
+
+    save_result=$("$vcli" js "$tab" "(() => {
+      const root = document.querySelector('ytls-broadcast-edit-dialog') || document;
+      const save = root.querySelector('#save-button button') || root.querySelector('ytcp-button#save-button button');
+      if (!save) return 'save-missing';
+      if (save.getAttribute('aria-disabled') === 'true' || save.disabled) return 'save-disabled';
+      save.click();
+      return 'save-clicked';
+    })()" 2>/dev/null || true)
+    if [[ $save_result == *save-clicked* ]]; then
+        log "saved YouTube Studio stream metadata"
+        sleep "${YOUTUBE_STREAM_SAVE_WAIT:-3}"
+    elif [[ $save_result == *save-disabled* ]]; then
+        log "YouTube Studio save button is disabled; metadata may already be saved"
+    else
+        die "could not save YouTube Studio metadata; refusing to start stream"
+    fi
+
+    page_text=$("$vcli" text "$tab" 2>/dev/null | head -n 40 || true)
+    if grep -qi 'Request access to streaming\|verify your phone number' <<<"$page_text"; then
+        die "YouTube account must finish Live access / phone verification before RTMP streaming will work"
+    fi
+
+    final_url=$(json_string_field "$js_result" url)
+    if [[ $final_url =~ studio\.youtube\.com/video/([^/?#]+)/livestreaming ]]; then
+        watch_url="https://www.youtube.com/watch?v=${BASH_REMATCH[1]}"
+        STREAM_WATCH_URL=$watch_url
+        log "opening public stream page in vimbrowser: $watch_url"
+        "$vcli" open "$watch_url" >/dev/null 2>&1 || warn "failed to open public stream page: $watch_url"
+    fi
+}
+
+prompt_for_stream_key() {
+    local key channel_hint
+
+    cat >&2 <<'EOF'
+youtube-stream: no YouTube stream key is configured.
+
+YouTube Studio should now be open in vimbrowser. In Live Control Room, use the
+Stream tab and copy your stream key. If YouTube asks to verify a phone number or
+request streaming access, finish that first; YouTube says access can take up to
+24 hours after the request.
+EOF
+
+    if [[ -t 0 ]]; then
+        printf 'Paste YouTube stream key (input hidden, empty to abort): ' >&2
+        IFS= read -rs key || true
+        printf '\n' >&2
+    else
+        die "no stream key configured and stdin is not a terminal; add YOUTUBE_STREAM_KEY to $CONFIG_FILE"
+    fi
+
+    [[ -n $key ]] || exit 130
+    append_config_if_missing YOUTUBE_STREAM_KEY "$key"
+    channel_hint=${YOUTUBE_STREAM_CHANNEL_ID:-}
+    [[ -n $channel_hint ]] && append_config_if_missing YOUTUBE_STREAM_CHANNEL_ID "$channel_hint"
+    printf '%s\n' "$key"
+}
+
+looks_like_google_api_key() {
+    [[ $1 == AIza* ]]
+}
+
+validate_stream_key() {
+    local key=$1
+
+    if looks_like_google_api_key "$key"; then
+        die "configured YOUTUBE_STREAM_KEY looks like a Google API key, not a YouTube Live stream key. Open YouTube Studio Live Control Room, copy the stream key from the Stream tab, and update $CONFIG_FILE"
+    fi
+    if [[ $key =~ ^https?:// || $key =~ ^rtmps?:// ]]; then
+        die "configured YOUTUBE_STREAM_KEY looks like a URL; use only the stream key, or set YOUTUBE_STREAM_URL to the full RTMP/RTMPS URL"
+    fi
+}
+
+validate_stream_url() {
+    local url=$1 key_part
+
+    [[ $url =~ ^rtmps?:// ]] || die "stream URL must start with rtmp:// or rtmps://"
+    key_part=${url##*/}
+    if looks_like_google_api_key "$key_part"; then
+        die "configured stream URL ends with something that looks like a Google API key, not a YouTube Live stream key. Update YOUTUBE_STREAM_KEY or YOUTUBE_STREAM_URL in $CONFIG_FILE"
+    fi
+}
+
+resolve_stream_url() {
+    local base key url
+
+    if [[ -n ${YOUTUBE_STREAM_URL:-} ]]; then
+        validate_stream_url "$YOUTUBE_STREAM_URL"
+        printf '%s\n' "$YOUTUBE_STREAM_URL"
+        return 0
+    fi
+
+    key=${YOUTUBE_STREAM_KEY:-}
+    if [[ -z $key ]]; then
+        key=$(prompt_for_stream_key)
+    fi
+    validate_stream_key "$key"
+
+    base=${YOUTUBE_STREAM_RTMP_BASE:-rtmp://a.rtmp.youtube.com/live2}
+    url="${base%/}/$key"
+    validate_stream_url "$url"
+    printf '%s\n' "$url"
+}
+
+print_command() {
+    local -n gsr_ref=$1
+    local -n ffmpeg_ref=$2
+    local arg
+
+    printf 'GSR: '
+    for arg in "${gsr_ref[@]}"; do printf '%q ' "$arg"; done
+    printf '\nFFMPEG: '
+    for arg in "${ffmpeg_ref[@]}"; do
+        if [[ $arg =~ ^rtmps?:// ]]; then
+            printf '%q ' "$(redact_url "$arg")"
+        else
+            printf '%q ' "$arg"
+        fi
+    done
+    printf '\n'
+}
+
+redact_stream_urls_from_stderr() {
+    sed -E 's#(rtmps?://[^[:space:]]+/live2/)[^[:space:]]+#\1<stream-key-redacted>#g'
+}
+
+cleanup_outline() {
+    if [[ -n ${OUTLINE_PID:-} ]]; then
+        kill "$OUTLINE_PID" >/dev/null 2>&1 || true
+        wait "$OUTLINE_PID" >/dev/null 2>&1 || true
+        OUTLINE_PID=""
+    fi
+}
+
+on_interrupt() {
+    printf '\n%s: stopping stream...\n' "$PROGRAM" >&2
+    cleanup_outline
+    exit 130
+}
+
+main() {
+    local title description thumbnail privacy monitor geometry outline_helper stream_url redacted_url
+    local fps video_codec video_bitrate gsr_encoder fallback_cpu keyint gsr_verbose
+    local mic_source_raw system_source_raw mic_source system_source mic_gain system_gain audio_bitrate audio_rate
+    local filter_complex
+    local -a gsr_args ffmpeg_args
+    local status
+
+    check_dependencies
+
+    if ((SETUP_ONLY)); then
+        if [[ -z ${YOUTUBE_STREAM_KEY:-} && -z ${YOUTUBE_STREAM_URL:-} ]]; then
+            prompt_for_stream_key >/dev/null || true
+        fi
+        log "setup complete; config: $CONFIG_FILE"
+        return 0
+    fi
+
+    validate_stream_metadata
+    title=$TITLE
+    description=$DESCRIPTION
+    thumbnail=$THUMBNAIL
+    privacy=$PRIVACY
+
+    if (( ! DRY_RUN )); then
+        apply_youtube_metadata_api "$title" "$description" "$thumbnail" "$privacy"
+    fi
+
+    stream_url=$(resolve_stream_url)
+    redacted_url=$(redact_url "$stream_url")
+
+    read -r monitor geometry < <(get_primary_monitor) || die "could not determine primary monitor with xrandr"
+
+    fps=${YOUTUBE_STREAM_FPS:-${QUICKREC_FPS:-$DEFAULT_FPS}}
+    video_codec=${YOUTUBE_STREAM_VIDEO_CODEC:-h264}
+    video_bitrate=${YOUTUBE_STREAM_VIDEO_BITRATE_KBPS:-$DEFAULT_VIDEO_BITRATE_KBPS}
+    gsr_encoder=${YOUTUBE_STREAM_ENCODER:-gpu}
+    fallback_cpu=${YOUTUBE_STREAM_FALLBACK_CPU_ENCODING:-yes}
+    keyint=${YOUTUBE_STREAM_KEYINT:-2}
+    gsr_verbose=${YOUTUBE_STREAM_GSR_VERBOSE:-no}
+
+    gsr_args=(
+        gpu-screen-recorder
+        -w "$monitor"
+        -f "$fps"
+        -c mkv
+        -k "$video_codec"
+        -bm cbr
+        -q "$video_bitrate"
+        -cursor yes
+        -keyint "$keyint"
+        -encoder "$gsr_encoder"
+        -fallback-cpu-encoding "$fallback_cpu"
+        -v "$gsr_verbose"
+        -o /dev/stdout
+    )
+
+    ffmpeg_args=(
+        ffmpeg
+        -hide_banner
+        -loglevel "${YOUTUBE_STREAM_FFMPEG_LOGLEVEL:-info}"
+        -nostdin
+        -thread_queue_size "${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-1024}"
+        -i pipe:0
+    )
+
+    if ((START_AUDIO)); then
+        mic_source_raw=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_MIC_SOURCE QUICKREC_MIC_SOURCE "$DEFAULT_MIC_SOURCE")
+        system_source_raw=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_SYSTEM_SOURCE QUICKREC_SYSTEM_SOURCE "$DEFAULT_SYSTEM_SOURCE")
+        mic_source=$(to_pulse_source "$mic_source_raw")
+        system_source=$(to_pulse_source "$system_source_raw")
+        mic_gain=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_MIC_GAIN QUICKREC_MIC_GAIN "$DEFAULT_MIC_GAIN")
+        system_gain=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_SYSTEM_GAIN QUICKREC_SYSTEM_GAIN "$DEFAULT_SYSTEM_GAIN")
+        audio_bitrate=${YOUTUBE_STREAM_AUDIO_BITRATE:-$DEFAULT_AUDIO_BITRATE}
+        audio_rate=${YOUTUBE_STREAM_AUDIO_RATE:-48000}
+
+        filter_complex="[1:a:0]volume=${mic_gain},aresample=async=1:first_pts=0[mic];[2:a:0]volume=${system_gain},aresample=async=1:first_pts=0[system];[mic][system]amix=inputs=2:duration=longest:dropout_transition=0,aresample=async=1:first_pts=0[a]"
+        ffmpeg_args+=(
+            -thread_queue_size "${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-1024}"
+            -f pulse
+            -i "$mic_source"
+            -thread_queue_size "${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-1024}"
+            -f pulse
+            -i "$system_source"
+            -filter_complex "$filter_complex"
+            -map 0:v:0
+            -map '[a]'
+            -c:v copy
+            -c:a aac
+            -b:a "$audio_bitrate"
+            -ac 2
+            -ar "$audio_rate"
+        )
+    else
+        ffmpeg_args+=(
+            -map 0:v:0
+            -c:v copy
+            -an
+        )
+    fi
+
+    ffmpeg_args+=(
+        -flvflags no_duration_filesize
+        -f flv
+        "$stream_url"
+    )
+
+    if ((DRY_RUN)); then
+        printf 'title: %s\ndescription: %s\nthumbnail: %s\nprivacy: %s\nmonitor: %s\ngeometry: %s\nstream: %s\n' "$title" "$description" "$thumbnail" "${privacy:-unchanged}" "$monitor" "$geometry" "$redacted_url"
+        print_command gsr_args ffmpeg_args
+        return 0
+    fi
+
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$title" >"$STATE_DIR/current-title"
+    printf '%s\n' "$description" >"$STATE_DIR/current-description"
+    printf '%s\n' "$thumbnail" >"$STATE_DIR/current-thumbnail"
+    [[ -n $privacy ]] && printf '%s\n' "$privacy" >"$STATE_DIR/current-privacy"
+    [[ -n $STREAM_WATCH_URL ]] && printf '%s\n' "$STREAM_WATCH_URL" >"$STATE_DIR/current-watch-url"
+    printf '%s\n' "$monitor $geometry" >"$STATE_DIR/current-monitor"
+
+    trap cleanup_outline EXIT
+    trap on_interrupt INT TERM
+
+    if ((START_OUTLINE)); then
+        outline_helper=$(find_outline_helper || true)
+        if [[ -n $outline_helper ]]; then
+            "$outline_helper" --geometry "$geometry" --parent-pid $$ &
+            OUTLINE_PID=$!
+        else
+            warn "purple outline unavailable: helper not found"
+        fi
+    fi
+
+    log "title: $title"
+    log "description: $description"
+    log "thumbnail: $thumbnail"
+    [[ -n $privacy ]] && log "privacy: $privacy"
+    log "capturing primary monitor: $monitor ($geometry)"
+    if ((START_AUDIO)); then
+        log "audio: mic=${mic_source:-?} gain=${mic_gain:-?}, system=${system_source:-?} gain=${system_gain:-?}"
+    else
+        log "audio: disabled"
+    fi
+    log "streaming to: $redacted_url"
+    log "press Ctrl+C to stop"
+
+    set +e
+    "${gsr_args[@]}" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+    status=$?
+    set -e
+
+    cleanup_outline
+    trap - EXIT INT TERM
+
+    if ((status == 0)); then
+        log "stream stopped"
+    else
+        warn "stream pipeline exited with status $status"
+    fi
+    return "$status"
+}
+
+main "$@"

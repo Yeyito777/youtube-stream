@@ -1,0 +1,46 @@
+# Copy to ~/.config/youtube-stream/config and chmod 600 it.
+# The youtube-stream command can also create this file after prompting for a key.
+
+# Either set a stream key and use the default YouTube RTMP endpoint...
+YOUTUBE_STREAM_KEY=
+YOUTUBE_STREAM_RTMP_BASE=rtmp://a.rtmp.youtube.com/live2
+
+# ...or set a full stream URL instead:
+# YOUTUBE_STREAM_URL=rtmp://a.rtmp.youtube.com/live2/xxxx-xxxx-xxxx-xxxx-xxxx
+
+# Optional: pin a specific existing broadcast/video if the API should not choose
+# the first non-complete Live broadcast automatically.
+# YOUTUBE_STREAM_BROADCAST_ID=VIDEO_ID
+
+# Capture / encoding
+YOUTUBE_STREAM_FPS=30
+YOUTUBE_STREAM_VIDEO_CODEC=h264
+YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
+YOUTUBE_STREAM_ENCODER=gpu
+YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=yes
+YOUTUBE_STREAM_KEYINT=2
+
+# Audio. Defaults mirror quickrec: default mic + default system audio,
+# then live ffmpeg volume/amix with quickrec's gains.
+YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
+YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
+YOUTUBE_STREAM_MIC_GAIN=7.875
+YOUTUBE_STREAM_SYSTEM_GAIN=0.675
+YOUTUBE_STREAM_AUDIO_BITRATE=192k
+YOUTUBE_STREAM_AUDIO_RATE=48000
+
+# Browser behavior. vimbrowser is only used to open the public watch page after
+# the YouTube Data API metadata update succeeds.
+YOUTUBE_STREAM_BROWSER_WAIT=5
+
+# Required to stream. You can set these here, but per-stream CLI args are usually better:
+#   youtube-stream -t 'Title' -d 'Description' -p /path/to/thumbnail.png
+# YOUTUBE_STREAM_TITLE='My stream title'
+# YOUTUBE_STREAM_DESCRIPTION='My stream description'
+# YOUTUBE_STREAM_THUMBNAIL=/path/to/thumbnail.png
+# Optional; if unset, the current broadcast privacy is left unchanged.
+# YOUTUBE_STREAM_PRIVACY=public
+
+# Optional helper overrides.
+# VIMBROWSER_CLI=/home/yeyito/Workspace/exocortex/external-tools/vimbrowser-cli/bin/vimbrowser-cli
+# YOUTUBE_STREAM_API_HELPER=/home/yeyito/.local/lib/youtube-stream/youtube-stream-api

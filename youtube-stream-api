@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import mimetypes
+import os
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+CONFIG_DIR = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "youtube-stream"
+CLIENT_SECRET_FILE = CONFIG_DIR / "client_secret.json"
+TOKEN_FILE = CONFIG_DIR / "oauth-token.json"
+YOUTUBE_API = "https://www.googleapis.com/youtube/v3/"
+YOUTUBE_UPLOAD_API = "https://www.googleapis.com/upload/youtube/v3/"
+
+
+def die(msg, status=1):
+    print(f"youtube-stream-api: error: {msg}", file=sys.stderr)
+    raise SystemExit(status)
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        die(f"missing {path}; create an OAuth desktop client and authorize it first")
+    except json.JSONDecodeError as e:
+        die(f"invalid JSON in {path}: {e}")
+
+
+def atomic_write_json(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    os.chmod(path, 0o600)
+
+
+def load_oauth_config():
+    token = read_json(TOKEN_FILE)
+    client = {}
+    if CLIENT_SECRET_FILE.exists():
+        raw = read_json(CLIENT_SECRET_FILE)
+        client = raw.get("installed") or raw.get("web") or raw
+    for key in ("client_id", "client_secret"):
+        token.setdefault(key, client.get(key))
+    if not token.get("client_id") or not token.get("client_secret"):
+        die(f"{TOKEN_FILE} does not contain OAuth client_id/client_secret and {CLIENT_SECRET_FILE} is missing them")
+    if not token.get("refresh_token"):
+        die(f"{TOKEN_FILE} does not contain a refresh_token; run OAuth setup again")
+    return token
+
+
+def http_json(method, url, access_token=None, body=None, headers=None, raw_data=None):
+    req_headers = dict(headers or {})
+    data = raw_data
+    if access_token:
+        req_headers["Authorization"] = f"Bearer {access_token}"
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req_headers.setdefault("Content-Type", "application/json; charset=UTF-8")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            payload = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(detail)
+            message = parsed.get("error", {}).get("message") or detail
+        except Exception:
+            message = detail
+        die(f"HTTP {e.code} from {url}: {message}")
+    if not payload:
+        return {}
+    return json.loads(payload)
+
+
+def access_token():
+    token = load_oauth_config()
+    now = int(time.time())
+    if token.get("access_token") and int(token.get("expires_at", 0)) > now + 120:
+        return token["access_token"]
+
+    body = urllib.parse.urlencode({
+        "client_id": token["client_id"],
+        "client_secret": token["client_secret"],
+        "refresh_token": token["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    refreshed = http_json(
+        "POST",
+        "https://oauth2.googleapis.com/token",
+        raw_data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    token.update(refreshed)
+    token["expires_at"] = now + int(refreshed.get("expires_in", 3600))
+    atomic_write_json(TOKEN_FILE, token)
+    return token["access_token"]
+
+
+def yt_get(path, params, token):
+    return http_json("GET", YOUTUBE_API + path + "?" + urllib.parse.urlencode(params), token)
+
+
+def yt_put(path, params, token, body):
+    return http_json("PUT", YOUTUBE_API + path + "?" + urllib.parse.urlencode(params), token, body=body)
+
+
+def yt_post_upload(path, params, token, file_path):
+    path_obj = pathlib.Path(file_path)
+    mime = mimetypes.guess_type(path_obj.name)[0] or "application/octet-stream"
+    boundary = "===============%s==" % uuid.uuid4().hex
+    data = b"".join([
+        f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{{}}\r\n".encode(),
+        f"--{boundary}\r\nContent-Type: {mime}\r\n\r\n".encode(),
+        path_obj.read_bytes(),
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ])
+    return http_json(
+        "POST",
+        YOUTUBE_UPLOAD_API + path + "?" + urllib.parse.urlencode(params),
+        token,
+        raw_data=data,
+        headers={"Content-Type": f"multipart/related; boundary={boundary}"},
+    )
+
+
+def choose_broadcast(items, requested_id=None):
+    if requested_id:
+        for item in items:
+            if item.get("id") == requested_id:
+                return item
+        die(f"configured broadcast/video id not found in authorized channel: {requested_id}")
+
+    rank = {
+        "live": 0,
+        "testing": 1,
+        "ready": 2,
+        "created": 3,
+        "revoked": 8,
+        "complete": 9,
+    }
+    usable = [item for item in items if item.get("status", {}).get("lifeCycleStatus") != "complete"]
+    if not usable:
+        die("no non-complete YouTube Live broadcast found; create/reuse one in YouTube Studio first")
+    usable.sort(key=lambda item: (
+        rank.get(item.get("status", {}).get("lifeCycleStatus"), 5),
+        item.get("snippet", {}).get("scheduledStartTime", ""),
+        item.get("snippet", {}).get("publishedAt", ""),
+    ))
+    return usable[0]
+
+
+def update(args):
+    token = access_token()
+    resp = yt_get("liveBroadcasts", {
+        "part": "id,snippet,status,contentDetails",
+        "mine": "true",
+        "maxResults": "25",
+    }, token)
+    item = choose_broadcast(resp.get("items", []), args.broadcast_id or os.environ.get("YOUTUBE_STREAM_BROADCAST_ID") or os.environ.get("YOUTUBE_STREAM_VIDEO_ID"))
+    video_id = item["id"]
+
+    parts = ["snippet"]
+    body = {
+        "id": video_id,
+        "snippet": {
+            "title": args.title,
+            "description": args.description,
+        },
+    }
+    if args.privacy:
+        parts.append("status")
+        body["status"] = {"privacyStatus": args.privacy}
+
+    updated = yt_put("liveBroadcasts", {"part": ",".join(parts)}, token, body)
+    thumb_resp = yt_post_upload("thumbnails/set", {"videoId": video_id, "uploadType": "multipart"}, token, args.thumbnail)
+
+    out = {
+        "video_id": video_id,
+        "watch_url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": updated.get("snippet", {}).get("title", args.title),
+        "description": updated.get("snippet", {}).get("description", args.description),
+        "life_cycle_status": item.get("status", {}).get("lifeCycleStatus"),
+        "privacy_status": updated.get("status", item.get("status", {})).get("privacyStatus"),
+        "thumbnail_updated": bool(thumb_resp.get("items")),
+    }
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="youtube-stream-api")
+    sub = parser.add_subparsers(dest="command", required=True)
+    up = sub.add_parser("update", help="update title/description/thumbnail on the current YouTube Live broadcast")
+    up.add_argument("--title", required=True)
+    up.add_argument("--description", required=True)
+    up.add_argument("--thumbnail", required=True)
+    up.add_argument("--privacy", choices=["public", "unlisted", "private"])
+    up.add_argument("--broadcast-id")
+    up.set_defaults(func=update)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
