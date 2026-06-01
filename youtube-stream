@@ -7,16 +7,23 @@ CONFIG_FILE="$CONFIG_DIR/config"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/youtube-stream"
 
 # quickrec-compatible defaults:
-DEFAULT_FPS=30
+DEFAULT_FPS=60
 DEFAULT_MIC_GAIN=10.5
 DEFAULT_SYSTEM_GAIN=0.675
 DEFAULT_AUDIO_BITRATE=192k
-DEFAULT_VIDEO_BITRATE_KBPS=6000
-DEFAULT_CAPTURE_BACKEND=ffmpeg-x11-x264
+DEFAULT_VIDEO_BITRATE_KBPS=12000
+DEFAULT_CAPTURE_BACKEND=ffmpeg-x11-vaapi
+DEFAULT_CDN_RESOLUTION=1080p
+DEFAULT_CDN_FRAME_RATE=60fps
 DEFAULT_X264_PRESET=veryfast
 DEFAULT_X264_TUNE=zerolatency
 DEFAULT_X264_PROFILE=high
 DEFAULT_X264_LEVEL=4.2
+DEFAULT_VAAPI_DEVICE=/dev/dri/renderD128
+DEFAULT_VAAPI_FILTER=format=nv12,hwupload
+DEFAULT_VAAPI_PROFILE=high
+DEFAULT_VAAPI_LEVEL=4.2
+DEFAULT_VAAPI_RC_MODE=CBR
 DEFAULT_GSR_CONTAINER=mkv
 DEFAULT_FRAME_MODE=cfr
 DEFAULT_THREAD_QUEUE_SIZE=4096
@@ -36,6 +43,7 @@ THUMBNAIL=""
 PRIVACY=""
 STREAM_WATCH_URL=""
 STREAM_BROADCAST_ID=""
+STREAM_URL_FROM_API=""
 STREAM_COMPLETED=0
 GPU_PERF_PATH=""
 GPU_PERF_OLD=""
@@ -72,14 +80,21 @@ Common config/env values:
   YOUTUBE_STREAM_DESCRIPTION='My stream description'
   YOUTUBE_STREAM_THUMBNAIL=/path/to/thumbnail.png
   YOUTUBE_STREAM_PRIVACY=public
-  YOUTUBE_STREAM_FPS=30
-  YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6000
-  YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264
+  YOUTUBE_STREAM_FPS=60
+  YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=12000
+  YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi
+  YOUTUBE_STREAM_CDN_RESOLUTION=1080p
+  YOUTUBE_STREAM_CDN_FRAME_RATE=60fps
+  YOUTUBE_STREAM_CREATE_LIVE_STREAM=yes
   YOUTUBE_STREAM_X264_PRESET=veryfast
   YOUTUBE_STREAM_X264_TUNE=zerolatency
   YOUTUBE_STREAM_X264_PROFILE=high
   YOUTUBE_STREAM_X264_LEVEL=4.2
   YOUTUBE_STREAM_VAAPI_DEVICE=/dev/dri/renderD128
+  YOUTUBE_STREAM_VAAPI_FILTER=format=nv12,hwupload
+  YOUTUBE_STREAM_VAAPI_PROFILE=high
+  YOUTUBE_STREAM_VAAPI_LEVEL=4.2
+  YOUTUBE_STREAM_VAAPI_RC_MODE=CBR
   YOUTUBE_STREAM_GSR_CONTAINER=mkv
   YOUTUBE_STREAM_FRAME_MODE=cfr
   YOUTUBE_STREAM_PIPE_BUFFER=64m
@@ -92,9 +107,11 @@ Common config/env values:
 Notes:
   - Audio defaults mirror quickrec's intent: mic + system audio mixed with
     boosted mic gain (10.5), system gain 0.675, and AAC 192k.
-  - Default capture/encoding uses ffmpeg x11grab + libx264 strict CBR for
-    higher text/screen quality. Set YOUTUBE_STREAM_CAPTURE_BACKEND=gsr to use
-    the gpu-screen-recorder backend instead.
+  - Default capture/encoding uses one ffmpeg process: x11grab + h264_vaapi at
+    1080p60/12Mbps. Set YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264 for the
+    CPU fallback, or gsr for the older gpu-screen-recorder backend.
+  - The API helper creates/reuses a YouTube Live Stream resource whose CDN
+    profile defaults to 1080p/60fps so the watch page can expose hd1080@60.
 EOF
 }
 
@@ -332,6 +349,19 @@ find_api_helper() {
     return 1
 }
 
+configure_youtube_cdn_defaults() {
+    local fps=$1
+    export YOUTUBE_STREAM_CDN_RESOLUTION="${YOUTUBE_STREAM_CDN_RESOLUTION:-$DEFAULT_CDN_RESOLUTION}"
+    if [[ -z ${YOUTUBE_STREAM_CDN_FRAME_RATE-} && -z ${YOUTUBE_STREAM_CDN_FRAMERATE-} ]]; then
+        if [[ $fps =~ ^[0-9]+$ ]] && (( fps >= 50 )); then
+            export YOUTUBE_STREAM_CDN_FRAME_RATE=60fps
+        else
+            export YOUTUBE_STREAM_CDN_FRAME_RATE=30fps
+        fi
+    fi
+    export YOUTUBE_STREAM_CREATE_LIVE_STREAM="${YOUTUBE_STREAM_CREATE_LIVE_STREAM:-yes}"
+}
+
 find_vimbrowser_cli() {
     local candidate
 
@@ -462,7 +492,7 @@ append_config_if_missing() {
 }
 
 apply_youtube_metadata_api() {
-    local title=$1 description=$2 thumbnail=$3 privacy=$4 helper result watch_url vcli
+    local title=$1 description=$2 thumbnail=$3 privacy=$4 helper result watch_url stream_url vcli
     local -a api_args
 
     helper=$(find_api_helper) || die "youtube-stream API helper not found; run 'make install'"
@@ -476,12 +506,15 @@ apply_youtube_metadata_api() {
     result=$("$helper" "${api_args[@]}") || die "failed to update YouTube stream metadata through API"
 
     watch_url=$(json_string_field "$result" watch_url)
+    stream_url=$(json_string_field "$result" stream_url)
     STREAM_WATCH_URL=$watch_url
+    STREAM_URL_FROM_API=$stream_url
     STREAM_BROADCAST_ID=$(json_string_field "$result" broadcast_id)
     [[ -n $STREAM_BROADCAST_ID ]] || STREAM_BROADCAST_ID=$(json_string_field "$result" video_id)
     log "updated YouTube stream metadata through API"
 
     if [[ -n $watch_url ]]; then
+        mkdir -p "$STATE_DIR"
         printf '%s\n' "$watch_url" >"$STATE_DIR/current-watch-url" 2>/dev/null || true
         log "stream page: $watch_url"
         if ((START_BROWSER)); then
@@ -832,7 +865,8 @@ on_interrupt() {
 main() {
     local title description thumbnail privacy monitor geometry outline_helper stream_url redacted_url
     local backend fps video_codec video_bitrate gsr_container frame_mode gsr_encoder fallback_cpu keyint gsr_verbose queue_size pipe_buffer use_pipe_buffer
-    local x264_preset x264_tune x264_profile x264_level keyframes capture_w capture_h capture_x capture_y display_name vaapi_device vaapi_filter
+    local x264_preset x264_tune x264_profile x264_level keyframes capture_w capture_h capture_x capture_y display_name
+    local vaapi_device vaapi_filter vaapi_profile vaapi_level vaapi_rc_mode
     local mic_source_raw system_source_raw mic_source system_source mic_gain system_gain audio_bitrate audio_rate
     local filter_complex
     local -a gsr_args ffmpeg_args stream_args
@@ -871,8 +905,11 @@ main() {
     queue_size=${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-$DEFAULT_THREAD_QUEUE_SIZE}
     pipe_buffer=${YOUTUBE_STREAM_PIPE_BUFFER:-$DEFAULT_PIPE_BUFFER}
     keyframes=${YOUTUBE_STREAM_KEYINT_FRAMES:-$((fps * keyint))}
-    vaapi_device=${YOUTUBE_STREAM_VAAPI_DEVICE:-/dev/dri/renderD128}
-    vaapi_filter=${YOUTUBE_STREAM_VAAPI_FILTER:-scale=1280:-2,format=nv12,hwupload}
+    vaapi_device=${YOUTUBE_STREAM_VAAPI_DEVICE:-$DEFAULT_VAAPI_DEVICE}
+    vaapi_filter=${YOUTUBE_STREAM_VAAPI_FILTER:-$DEFAULT_VAAPI_FILTER}
+    vaapi_profile=${YOUTUBE_STREAM_VAAPI_PROFILE:-$DEFAULT_VAAPI_PROFILE}
+    vaapi_level=${YOUTUBE_STREAM_VAAPI_LEVEL:-$DEFAULT_VAAPI_LEVEL}
+    vaapi_rc_mode=${YOUTUBE_STREAM_VAAPI_RC_MODE:-$DEFAULT_VAAPI_RC_MODE}
     use_pipe_buffer=0
 
     case $backend in
@@ -898,11 +935,17 @@ main() {
             ;;
     esac
 
+    configure_youtube_cdn_defaults "$fps"
+
     if (( ! DRY_RUN )); then
         apply_youtube_metadata_api "$title" "$description" "$thumbnail" "$privacy"
     fi
 
-    stream_url=$(resolve_stream_url)
+    if [[ -n $STREAM_URL_FROM_API ]]; then
+        stream_url=$STREAM_URL_FROM_API
+    else
+        stream_url=$(resolve_stream_url)
+    fi
     redacted_url=$(redact_url "$stream_url")
 
     read -r monitor geometry < <(get_primary_monitor) || die "could not determine primary monitor with xrandr"
@@ -977,6 +1020,7 @@ main() {
                 -sc_threshold 0
                 -bf 0
                 -r "$fps"
+                -fps_mode cfr
             )
             if ((START_AUDIO)); then
                 stream_args+=(
@@ -1030,9 +1074,9 @@ main() {
             stream_args+=(
                 -vf "$vaapi_filter"
                 -c:v h264_vaapi
-                -profile:v high
-                -level 4.0
-                -rc_mode CBR
+                -profile:v "$vaapi_profile"
+                -level "$vaapi_level"
+                -rc_mode "$vaapi_rc_mode"
                 -b:v "${video_bitrate}k"
                 -maxrate "${video_bitrate}k"
                 -bufsize "$((video_bitrate * 2))k"
@@ -1040,6 +1084,8 @@ main() {
                 -bf 0
                 -idr_interval 0
                 -aud 1
+                -r "$fps"
+                -fps_mode cfr
             )
             if ((START_AUDIO)); then
                 stream_args+=(

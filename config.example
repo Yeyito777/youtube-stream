@@ -12,21 +12,31 @@ YOUTUBE_STREAM_RTMP_BASE=rtmp://a.rtmp.youtube.com/live2
 # the first non-complete Live broadcast automatically.
 # YOUTUBE_STREAM_BROADCAST_ID=VIDEO_ID
 
+# YouTube Live Stream CDN profile. The API helper creates/reuses a matching
+# 1080p60 stream-key resource and returns that ingest URL to ffmpeg.
+YOUTUBE_STREAM_CDN_RESOLUTION=1080p
+YOUTUBE_STREAM_CDN_FRAME_RATE=60fps
+YOUTUBE_STREAM_CREATE_LIVE_STREAM=yes
+# YOUTUBE_STREAM_LIVE_STREAM_TITLE='youtube-stream 1080p60'
+# YOUTUBE_STREAM_INGEST_PROTOCOL=rtmp
+# YOUTUBE_STREAM_LIVE_STREAM_ID=STREAM_RESOURCE_ID
+
 # Capture / encoding
-YOUTUBE_STREAM_FPS=30
+YOUTUBE_STREAM_FPS=60
 YOUTUBE_STREAM_VIDEO_CODEC=h264
-YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6000
-# Default is the OBS-like one-process ffmpeg/x11grab/libx264 path for better text quality.
-# Set to gsr to use gpu-screen-recorder + ffmpeg remuxing instead.
-YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264
+YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=12000
+# Default is the one-process ffmpeg/x11grab/h264_vaapi GPU path for 1080p60.
+# Set to ffmpeg-x11-x264 for the CPU fallback, or gsr for gpu-screen-recorder + ffmpeg remuxing.
+YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi
 YOUTUBE_STREAM_X264_PRESET=veryfast
 YOUTUBE_STREAM_X264_TUNE=zerolatency
 YOUTUBE_STREAM_X264_PROFILE=high
 YOUTUBE_STREAM_X264_LEVEL=4.2
-# Alternative direct-ffmpeg GPU backend: set YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi
 YOUTUBE_STREAM_VAAPI_DEVICE=/dev/dri/renderD128
-# VAAPI defaults to 1280x720 because this AMD encoder path could not sustain 1080p30 reliably.
-YOUTUBE_STREAM_VAAPI_FILTER=scale=1280:-2,format=nv12,hwupload
+YOUTUBE_STREAM_VAAPI_FILTER=format=nv12,hwupload
+YOUTUBE_STREAM_VAAPI_PROFILE=high
+YOUTUBE_STREAM_VAAPI_LEVEL=4.2
+YOUTUBE_STREAM_VAAPI_RC_MODE=CBR
 # gpu-screen-recorder backend settings:
 YOUTUBE_STREAM_GSR_CONTAINER=mkv
 YOUTUBE_STREAM_FRAME_MODE=cfr

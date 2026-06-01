@@ -145,8 +145,31 @@ def list_broadcasts(token):
     }, token).get("items", [])
 
 
+def desired_stream_profile():
+    resolution = os.environ.get("YOUTUBE_STREAM_CDN_RESOLUTION", "1080p")
+    frame_rate = os.environ.get("YOUTUBE_STREAM_CDN_FRAME_RATE") or os.environ.get("YOUTUBE_STREAM_CDN_FRAMERATE", "60fps")
+    title = os.environ.get("YOUTUBE_STREAM_LIVE_STREAM_TITLE", f"youtube-stream {resolution}{frame_rate.replace('fps', '')}")
+    protocol = os.environ.get("YOUTUBE_STREAM_INGEST_PROTOCOL", "rtmp").lower()
+    if protocol not in ("rtmp", "rtmps"):
+        die("YOUTUBE_STREAM_INGEST_PROTOCOL must be rtmp or rtmps")
+    return resolution, frame_rate, title, protocol
+
+
+def stream_ingestion_url(stream, protocol="rtmp"):
+    info = stream.get("cdn", {}).get("ingestionInfo", {})
+    stream_name = info.get("streamName")
+    if not stream_name:
+        die(f"live stream {stream.get('id')} has no ingestion streamName")
+    address_key = "rtmpsIngestionAddress" if protocol == "rtmps" else "ingestionAddress"
+    address = info.get(address_key) or info.get("ingestionAddress")
+    if not address:
+        die(f"live stream {stream.get('id')} has no ingestion address")
+    return f"{address.rstrip('/')}/{stream_name}"
+
+
 def choose_live_stream(token):
     configured = os.environ.get("YOUTUBE_STREAM_ID") or os.environ.get("YOUTUBE_STREAM_LIVE_STREAM_ID")
+    resolution, frame_rate, title, _ = desired_stream_profile()
     if configured:
         resp = yt_get("liveStreams", {"part": "id,snippet,cdn,status", "id": configured}, token)
         items = resp.get("items", [])
@@ -156,25 +179,45 @@ def choose_live_stream(token):
 
     resp = yt_get("liveStreams", {"part": "id,snippet,cdn,status", "mine": "true", "maxResults": "50"}, token)
     items = resp.get("items", [])
-    if not items:
-        die("no YouTube Live stream key resource found; create one in YouTube Studio first")
+
+    matching = [
+        item for item in items
+        if item.get("cdn", {}).get("resolution") == resolution
+        and item.get("cdn", {}).get("frameRate") == frame_rate
+    ]
+
+    if not matching:
+        create = os.environ.get("YOUTUBE_STREAM_CREATE_LIVE_STREAM", "yes").lower()
+        if create in ("", "0", "no", "false", "off"):
+            die(f"no YouTube Live stream key resource found for {resolution}/{frame_rate}; create one or unset YOUTUBE_STREAM_CREATE_LIVE_STREAM=off")
+        body = {
+            "snippet": {
+                "title": title,
+                "description": f"Reusable stream key for youtube-stream {resolution} {frame_rate}",
+            },
+            "cdn": {
+                "ingestionType": "rtmp",
+                "resolution": resolution,
+                "frameRate": frame_rate,
+            },
+        }
+        return yt_post("liveStreams", {"part": "snippet,cdn"}, token, body)
 
     def score(item):
-        title = item.get("snippet", {}).get("title", "")
+        item_title = item.get("snippet", {}).get("title", "")
         status = item.get("status", {}).get("streamStatus", "")
         return (
-            0 if "default" in title.lower() else 1,
+            0 if item_title == title else 1,
             0 if status in ("inactive", "ready", "active") else 1,
-            title,
+            item_title,
         )
 
-    items.sort(key=score)
-    return items[0]
+    matching.sort(key=score)
+    return matching[0]
 
 
-def create_broadcast(token, title, description, privacy):
+def create_broadcast(token, title, description, privacy, stream):
     scheduled = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 15))
-    stream = choose_live_stream(token)
     body = {
         "snippet": {
             "title": title,
@@ -196,6 +239,21 @@ def create_broadcast(token, title, description, privacy):
     broadcast = yt_post("liveBroadcasts", {"part": "snippet,status,contentDetails"}, token, body)
     return yt_post("liveBroadcasts/bind", {
         "id": broadcast["id"],
+        "part": "id,snippet,status,contentDetails",
+        "streamId": stream["id"],
+    }, token, {})
+
+
+def ensure_broadcast_bound(token, broadcast, stream):
+    video_id = broadcast["id"]
+    current = broadcast.get("contentDetails", {}).get("boundStreamId")
+    if current == stream["id"]:
+        return broadcast
+    status = broadcast.get("status", {}).get("lifeCycleStatus")
+    if status in ("live", "testing"):
+        die(f"broadcast {video_id} is already {status} but is not bound to the requested {stream['cdn']['resolution']}/{stream['cdn']['frameRate']} stream")
+    return yt_post("liveBroadcasts/bind", {
+        "id": video_id,
         "part": "id,snippet,status,contentDetails",
         "streamId": stream["id"],
     }, token, {})
@@ -230,14 +288,18 @@ def choose_broadcast(items, requested_id=None):
 def update(args):
     token = access_token()
     privacy = args.privacy or "private"
+    stream = choose_live_stream(token)
+    _, _, _, protocol = desired_stream_profile()
     requested_id = args.broadcast_id or os.environ.get("YOUTUBE_STREAM_BROADCAST_ID") or os.environ.get("YOUTUBE_STREAM_VIDEO_ID")
     item = choose_broadcast(list_broadcasts(token), requested_id)
     created = False
     if item is None:
         if requested_id:
             die(f"configured broadcast/video id is complete and cannot be reused: {requested_id}")
-        item = create_broadcast(token, args.title, args.description, privacy)
+        item = create_broadcast(token, args.title, args.description, privacy, stream)
         created = True
+    else:
+        item = ensure_broadcast_bound(token, item, stream)
 
     video_id = item["id"]
 
@@ -260,6 +322,10 @@ def update(args):
         "broadcast_id": video_id,
         "video_id": video_id,
         "watch_url": f"https://www.youtube.com/watch?v={video_id}",
+        "stream_id": stream.get("id"),
+        "stream_resolution": stream.get("cdn", {}).get("resolution"),
+        "stream_frame_rate": stream.get("cdn", {}).get("frameRate"),
+        "stream_url": stream_ingestion_url(stream, protocol),
         "title": updated.get("snippet", {}).get("title", args.title),
         "description": updated.get("snippet", {}).get("description", args.description),
         "life_cycle_status": updated.get("status", item.get("status", {})).get("lifeCycleStatus"),
