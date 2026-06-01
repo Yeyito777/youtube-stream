@@ -173,7 +173,7 @@ def choose_live_stream(token):
 
 
 def create_broadcast(token, title, description, privacy):
-    scheduled = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 300))
+    scheduled = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 15))
     stream = choose_live_stream(token)
     body = {
         "snippet": {

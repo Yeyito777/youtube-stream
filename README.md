@@ -153,9 +153,11 @@ Important defaults:
 ```sh
 YOUTUBE_STREAM_FPS=30
 YOUTUBE_STREAM_VIDEO_CODEC=h264
-YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
-YOUTUBE_STREAM_GSR_CONTAINER=flv
+YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=5000
+YOUTUBE_STREAM_GSR_CONTAINER=mkv
 YOUTUBE_STREAM_FRAME_MODE=cfr
+YOUTUBE_STREAM_PIPE_BUFFER=64m
+YOUTUBE_STREAM_GPU_PERF=high
 YOUTUBE_STREAM_ENCODER=gpu
 YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=yes
 YOUTUBE_STREAM_THREAD_QUEUE_SIZE=4096
@@ -175,7 +177,7 @@ system gain: 0.675
 
 ## Notes
 
-- `gpu-screen-recorder` does the screen capture and video encoding. The default live pipe is `flv` plus constant frame rate (`cfr`) to avoid Matroska/VFR burstiness and periodic playback stalls. `ffmpeg` receives the already encoded H.264 video, captures/mixes PulseAudio/PipeWire audio live, AAC-encodes the mixed audio, and muxes/pushes RTMP with low-latency muxing flags.
+- `gpu-screen-recorder` does the screen capture and video encoding. The default live pipe is Matroska (`mkv`) with constant frame rate (`cfr`) timestamps, plus a `pv` userspace pipe buffer so RTMP/keyframe bursts do not immediately backpressure screen capture. The wrapper also best-effort pins the GPU performance level to `high` during capture to avoid AMD idle-clock throttling, then restores the previous level on shutdown. `ffmpeg` receives the already encoded H.264 video, captures/mixes PulseAudio/PipeWire audio live, AAC-encodes the mixed audio, and muxes/pushes RTMP.
 - If the previous broadcast has completed, the API helper creates a fresh Live broadcast and binds it to your existing/default stream key before starting the encoder push.
 - On normal exit or `Ctrl+C`, the wrapper attempts to mark the active YouTube broadcast `complete` through the API so shutdown is deterministic instead of relying only on YouTube auto-stop.
 - YouTube may still require the Studio stream to have auto-start enabled, or you may need to click **Go live** after the stream preview appears. This tool updates title/description/thumbnail metadata through the YouTube Data API, opens the public watch page, and starts the encoder push; it does not force-click destructive YouTube Studio actions by default.
@@ -186,4 +188,5 @@ system gain: 0.675
 - `ffmpeg`
 - `xrandr`
 - `vimbrowser-cli`
+- `pv` (optional but recommended; used for the default video pipe buffer)
 - X11 development libraries to build the outline helper (`libX11`, `libXext`)

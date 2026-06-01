@@ -15,10 +15,13 @@ YOUTUBE_STREAM_RTMP_BASE=rtmp://a.rtmp.youtube.com/live2
 # Capture / encoding
 YOUTUBE_STREAM_FPS=30
 YOUTUBE_STREAM_VIDEO_CODEC=h264
-YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
-# flv + cfr keeps the live pipe steady; mkv/vfr can introduce periodic stalls.
-YOUTUBE_STREAM_GSR_CONTAINER=flv
+YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=5000
+# mkv + cfr gives stable timestamps; the pv buffer decouples capture from RTMP bursts.
+YOUTUBE_STREAM_GSR_CONTAINER=mkv
 YOUTUBE_STREAM_FRAME_MODE=cfr
+YOUTUBE_STREAM_PIPE_BUFFER=64m
+# Best-effort: keeps AMD GPU clocks from idling during capture; set auto/off to disable.
+YOUTUBE_STREAM_GPU_PERF=high
 YOUTUBE_STREAM_ENCODER=gpu
 YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=yes
 YOUTUBE_STREAM_KEYINT=2

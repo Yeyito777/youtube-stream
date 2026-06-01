@@ -11,10 +11,12 @@ DEFAULT_FPS=30
 DEFAULT_MIC_GAIN=10.5
 DEFAULT_SYSTEM_GAIN=0.675
 DEFAULT_AUDIO_BITRATE=192k
-DEFAULT_VIDEO_BITRATE_KBPS=6800
-DEFAULT_GSR_CONTAINER=flv
+DEFAULT_VIDEO_BITRATE_KBPS=5000
+DEFAULT_GSR_CONTAINER=mkv
 DEFAULT_FRAME_MODE=cfr
 DEFAULT_THREAD_QUEUE_SIZE=4096
+DEFAULT_PIPE_BUFFER=64m
+DEFAULT_GPU_PERF=high
 DEFAULT_MIC_SOURCE=default_input
 DEFAULT_SYSTEM_SOURCE=default_output
 
@@ -30,6 +32,9 @@ PRIVACY=""
 STREAM_WATCH_URL=""
 STREAM_BROADCAST_ID=""
 STREAM_COMPLETED=0
+GPU_PERF_PATH=""
+GPU_PERF_OLD=""
+GPU_PERF_SET=0
 
 usage() {
     cat <<'EOF'
@@ -63,9 +68,11 @@ Common config/env values:
   YOUTUBE_STREAM_THUMBNAIL=/path/to/thumbnail.png
   YOUTUBE_STREAM_PRIVACY=public
   YOUTUBE_STREAM_FPS=30
-  YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
-  YOUTUBE_STREAM_GSR_CONTAINER=flv
+  YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=5000
+  YOUTUBE_STREAM_GSR_CONTAINER=mkv
   YOUTUBE_STREAM_FRAME_MODE=cfr
+  YOUTUBE_STREAM_PIPE_BUFFER=64m
+  YOUTUBE_STREAM_GPU_PERF=high
   YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
   YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
   YOUTUBE_STREAM_MIC_GAIN=10.5
@@ -710,6 +717,50 @@ redact_stream_urls_from_stderr() {
     sed -E 's#(rtmps?://[^[:space:]]+/live2/)[^[:space:]]+#\1<stream-key-redacted>#g'
 }
 
+write_sysfs_value() {
+    local path=$1 value=$2
+
+    if [[ -w $path ]]; then
+        printf '%s\n' "$value" >"$path"
+        return 0
+    fi
+    if have sudo; then
+        printf '%s\n' "$value" | sudo -n tee "$path" >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+enable_gpu_performance() {
+    local mode=${YOUTUBE_STREAM_GPU_PERF:-$DEFAULT_GPU_PERF} path
+
+    case ${mode,,} in
+        ""|0|no|false|off|auto)
+            return 0
+            ;;
+    esac
+
+    for path in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+        [[ -e $path ]] || continue
+        GPU_PERF_PATH=$path
+        GPU_PERF_OLD=$(cat "$path" 2>/dev/null || true)
+        if write_sysfs_value "$path" "$mode"; then
+            GPU_PERF_SET=1
+            log "GPU performance level: ${GPU_PERF_OLD:-unknown} -> $mode"
+        else
+            warn "could not set GPU performance level to $mode via $path"
+        fi
+        return 0
+    done
+}
+
+restore_gpu_performance() {
+    (( GPU_PERF_SET == 1 )) || return 0
+    [[ -n $GPU_PERF_PATH && -n $GPU_PERF_OLD ]] || return 0
+    write_sysfs_value "$GPU_PERF_PATH" "$GPU_PERF_OLD" || true
+    GPU_PERF_SET=0
+}
+
 cleanup_outline() {
     if [[ -n ${OUTLINE_PID:-} ]]; then
         kill "$OUTLINE_PID" >/dev/null 2>&1 || true
@@ -736,6 +787,7 @@ complete_youtube_broadcast() {
 cleanup_stream() {
     cleanup_outline
     complete_youtube_broadcast
+    restore_gpu_performance
 }
 
 on_interrupt() {
@@ -746,7 +798,7 @@ on_interrupt() {
 
 main() {
     local title description thumbnail privacy monitor geometry outline_helper stream_url redacted_url
-    local fps video_codec video_bitrate gsr_container frame_mode gsr_encoder fallback_cpu keyint gsr_verbose queue_size
+    local fps video_codec video_bitrate gsr_container frame_mode gsr_encoder fallback_cpu keyint gsr_verbose queue_size pipe_buffer use_pipe_buffer
     local mic_source_raw system_source_raw mic_source system_source mic_gain system_gain audio_bitrate audio_rate
     local filter_complex
     local -a gsr_args ffmpeg_args
@@ -787,6 +839,18 @@ main() {
     keyint=${YOUTUBE_STREAM_KEYINT:-2}
     gsr_verbose=${YOUTUBE_STREAM_GSR_VERBOSE:-no}
     queue_size=${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-$DEFAULT_THREAD_QUEUE_SIZE}
+    pipe_buffer=${YOUTUBE_STREAM_PIPE_BUFFER:-$DEFAULT_PIPE_BUFFER}
+    use_pipe_buffer=0
+    case ${pipe_buffer,,} in
+        ""|0|no|false|off|none) ;;
+        *)
+            if have pv; then
+                use_pipe_buffer=1
+            else
+                warn "pv not found; continuing without the extra video pipe buffer"
+            fi
+            ;;
+    esac
 
     gsr_args=(
         gpu-screen-recorder
@@ -850,10 +914,6 @@ main() {
     fi
 
     ffmpeg_args+=(
-        -max_interleave_delta 0
-        -muxdelay 0
-        -muxpreload 0
-        -flush_packets 1
         -flvflags no_duration_filesize
         -f flv
         "$stream_url"
@@ -862,6 +922,9 @@ main() {
     if ((DRY_RUN)); then
         printf 'title: %s\ndescription: %s\nthumbnail: %s\nprivacy: %s\nmonitor: %s\ngeometry: %s\nstream: %s\n' "$title" "$description" "$thumbnail" "${privacy:-unchanged}" "$monitor" "$geometry" "$redacted_url"
         print_command gsr_args ffmpeg_args
+        if ((use_pipe_buffer)); then
+            printf 'VIDEO BUFFER: pv -q -B %q\n' "$pipe_buffer"
+        fi
         return 0
     fi
 
@@ -876,6 +939,8 @@ main() {
 
     trap cleanup_stream EXIT
     trap on_interrupt INT TERM
+
+    enable_gpu_performance
 
     if ((START_OUTLINE)); then
         outline_helper=$(find_outline_helper || true)
@@ -901,7 +966,11 @@ main() {
     log "press Ctrl+C to stop"
 
     set +e
-    "${gsr_args[@]}" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+    if ((use_pipe_buffer)); then
+        "${gsr_args[@]}" | pv -q -B "$pipe_buffer" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+    else
+        "${gsr_args[@]}" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+    fi
     status=$?
     set -e
 
