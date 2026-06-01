@@ -153,7 +153,17 @@ Important defaults:
 ```sh
 YOUTUBE_STREAM_FPS=30
 YOUTUBE_STREAM_VIDEO_CODEC=h264
-YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=5000
+YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6000
+YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264
+YOUTUBE_STREAM_X264_PRESET=veryfast
+YOUTUBE_STREAM_X264_TUNE=zerolatency
+YOUTUBE_STREAM_X264_PROFILE=high
+YOUTUBE_STREAM_X264_LEVEL=4.2
+# Alternative direct-ffmpeg GPU backend: YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi
+YOUTUBE_STREAM_VAAPI_DEVICE=/dev/dri/renderD128
+# VAAPI defaults to 1280x720 because this AMD encoder path could not sustain 1080p30 reliably.
+YOUTUBE_STREAM_VAAPI_FILTER=scale=1280:-2,format=nv12,hwupload
+# gpu-screen-recorder backend settings, if YOUTUBE_STREAM_CAPTURE_BACKEND=gsr:
 YOUTUBE_STREAM_GSR_CONTAINER=mkv
 YOUTUBE_STREAM_FRAME_MODE=cfr
 YOUTUBE_STREAM_PIPE_BUFFER=64m
@@ -177,16 +187,18 @@ system gain: 0.675
 
 ## Notes
 
-- `gpu-screen-recorder` does the screen capture and video encoding. The default live pipe is Matroska (`mkv`) with constant frame rate (`cfr`) timestamps, plus a `pv` userspace pipe buffer so RTMP/keyframe bursts do not immediately backpressure screen capture. The wrapper also best-effort pins the GPU performance level to `high` during capture to avoid AMD idle-clock throttling, then restores the previous level on shutdown. `ffmpeg` receives the already encoded H.264 video, captures/mixes PulseAudio/PipeWire audio live, AAC-encodes the mixed audio, and muxes/pushes RTMP.
+- The default capture path is an OBS-like one-process `ffmpeg` pipeline using `x11grab` + `libx264` with strict CBR (`nal-hrd=cbr:filler=1`), zero-latency tune, 2-second keyframes, High profile/level 4.2, and 6 Mbps video. This costs more CPU than GPU Screen Recorder but produces visibly better text/screen quality and avoids the pipe/backpressure behavior that made the GSR path buffer/chop.
+- A direct-ffmpeg GPU path is available with `YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi`; it mirrors the architecture used by the `active-development/record` stream helper more closely than GSR does. Full 1080p30 VAAPI on this AMD path dropped encoder frames in testing, so its default filter scales to 1280x720. Keep x264 as the default for high-quality YouTube desktop/text streams.
+- The old GPU Screen Recorder path remains available with `YOUTUBE_STREAM_CAPTURE_BACKEND=gsr`. In that mode the live pipe is Matroska (`mkv`) with constant frame rate (`cfr`) timestamps plus a `pv` userspace pipe buffer. For GPU backends, the wrapper can best-effort pin the GPU performance level to `high` during capture, then restores the previous level on shutdown.
 - If the previous broadcast has completed, the API helper creates a fresh Live broadcast and binds it to your existing/default stream key before starting the encoder push.
 - On normal exit or `Ctrl+C`, the wrapper attempts to mark the active YouTube broadcast `complete` through the API so shutdown is deterministic instead of relying only on YouTube auto-stop.
 - YouTube may still require the Studio stream to have auto-start enabled, or you may need to click **Go live** after the stream preview appears. This tool updates title/description/thumbnail metadata through the YouTube Data API, opens the public watch page, and starts the encoder push; it does not force-click destructive YouTube Studio actions by default.
 
 ## Dependencies
 
-- `gpu-screen-recorder`
 - `ffmpeg`
 - `xrandr`
 - `vimbrowser-cli`
-- `pv` (optional but recommended; used for the default video pipe buffer)
+- `gpu-screen-recorder` (optional; only needed for `YOUTUBE_STREAM_CAPTURE_BACKEND=gsr`)
+- `pv` (optional; only used for the GSR video pipe buffer)
 - X11 development libraries to build the outline helper (`libX11`, `libXext`)

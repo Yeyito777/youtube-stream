@@ -15,12 +15,23 @@ YOUTUBE_STREAM_RTMP_BASE=rtmp://a.rtmp.youtube.com/live2
 # Capture / encoding
 YOUTUBE_STREAM_FPS=30
 YOUTUBE_STREAM_VIDEO_CODEC=h264
-YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=5000
-# mkv + cfr gives stable timestamps; the pv buffer decouples capture from RTMP bursts.
+YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6000
+# Default is the OBS-like one-process ffmpeg/x11grab/libx264 path for better text quality.
+# Set to gsr to use gpu-screen-recorder + ffmpeg remuxing instead.
+YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264
+YOUTUBE_STREAM_X264_PRESET=veryfast
+YOUTUBE_STREAM_X264_TUNE=zerolatency
+YOUTUBE_STREAM_X264_PROFILE=high
+YOUTUBE_STREAM_X264_LEVEL=4.2
+# Alternative direct-ffmpeg GPU backend: set YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi
+YOUTUBE_STREAM_VAAPI_DEVICE=/dev/dri/renderD128
+# VAAPI defaults to 1280x720 because this AMD encoder path could not sustain 1080p30 reliably.
+YOUTUBE_STREAM_VAAPI_FILTER=scale=1280:-2,format=nv12,hwupload
+# gpu-screen-recorder backend settings:
 YOUTUBE_STREAM_GSR_CONTAINER=mkv
 YOUTUBE_STREAM_FRAME_MODE=cfr
 YOUTUBE_STREAM_PIPE_BUFFER=64m
-# Best-effort: keeps AMD GPU clocks from idling during capture; set auto/off to disable.
+# Best-effort for GPU backends only: keeps AMD GPU clocks from idling during capture; set auto/off to disable.
 YOUTUBE_STREAM_GPU_PERF=high
 YOUTUBE_STREAM_ENCODER=gpu
 YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=yes

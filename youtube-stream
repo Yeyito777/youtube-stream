@@ -11,7 +11,12 @@ DEFAULT_FPS=30
 DEFAULT_MIC_GAIN=10.5
 DEFAULT_SYSTEM_GAIN=0.675
 DEFAULT_AUDIO_BITRATE=192k
-DEFAULT_VIDEO_BITRATE_KBPS=5000
+DEFAULT_VIDEO_BITRATE_KBPS=6000
+DEFAULT_CAPTURE_BACKEND=ffmpeg-x11-x264
+DEFAULT_X264_PRESET=veryfast
+DEFAULT_X264_TUNE=zerolatency
+DEFAULT_X264_PROFILE=high
+DEFAULT_X264_LEVEL=4.2
 DEFAULT_GSR_CONTAINER=mkv
 DEFAULT_FRAME_MODE=cfr
 DEFAULT_THREAD_QUEUE_SIZE=4096
@@ -68,7 +73,13 @@ Common config/env values:
   YOUTUBE_STREAM_THUMBNAIL=/path/to/thumbnail.png
   YOUTUBE_STREAM_PRIVACY=public
   YOUTUBE_STREAM_FPS=30
-  YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=5000
+  YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6000
+  YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264
+  YOUTUBE_STREAM_X264_PRESET=veryfast
+  YOUTUBE_STREAM_X264_TUNE=zerolatency
+  YOUTUBE_STREAM_X264_PROFILE=high
+  YOUTUBE_STREAM_X264_LEVEL=4.2
+  YOUTUBE_STREAM_VAAPI_DEVICE=/dev/dri/renderD128
   YOUTUBE_STREAM_GSR_CONTAINER=mkv
   YOUTUBE_STREAM_FRAME_MODE=cfr
   YOUTUBE_STREAM_PIPE_BUFFER=64m
@@ -81,9 +92,9 @@ Common config/env values:
 Notes:
   - Audio defaults mirror quickrec's intent: mic + system audio mixed with
     boosted mic gain (10.5), system gain 0.675, and AAC 192k.
-  - Capture/encoding uses gpu-screen-recorder and the GPU in constant-frame-rate
-    mode. ffmpeg only muxes the already-encoded video with live mixed audio and
-    pushes low-latency FLV/RTMP.
+  - Default capture/encoding uses ffmpeg x11grab + libx264 strict CBR for
+    higher text/screen quality. Set YOUTUBE_STREAM_CAPTURE_BACKEND=gsr to use
+    the gpu-screen-recorder backend instead.
 EOF
 }
 
@@ -193,7 +204,6 @@ require_command() {
 }
 
 check_dependencies() {
-    require_command gpu-screen-recorder
     require_command ffmpeg
     require_command xrandr
     require_command python3
@@ -713,6 +723,22 @@ print_command() {
     printf '\n'
 }
 
+print_single_command() {
+    local label=$1
+    local -n ref=$2
+    local arg
+
+    printf '%s: ' "$label"
+    for arg in "${ref[@]}"; do
+        if [[ $arg =~ ^rtmps?:// ]]; then
+            printf '%q ' "$(redact_url "$arg")"
+        else
+            printf '%q ' "$arg"
+        fi
+    done
+    printf '\n'
+}
+
 redact_stream_urls_from_stderr() {
     sed -E 's#(rtmps?://[^[:space:]]+/live2/)[^[:space:]]+#\1<stream-key-redacted>#g'
 }
@@ -761,6 +787,13 @@ restore_gpu_performance() {
     GPU_PERF_SET=0
 }
 
+backend_uses_gpu() {
+    case "$1" in
+        gsr|gpu-screen-recorder|ffmpeg-x11-vaapi|vaapi|ffmpeg-vaapi) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 cleanup_outline() {
     if [[ -n ${OUTLINE_PID:-} ]]; then
         kill "$OUTLINE_PID" >/dev/null 2>&1 || true
@@ -798,10 +831,11 @@ on_interrupt() {
 
 main() {
     local title description thumbnail privacy monitor geometry outline_helper stream_url redacted_url
-    local fps video_codec video_bitrate gsr_container frame_mode gsr_encoder fallback_cpu keyint gsr_verbose queue_size pipe_buffer use_pipe_buffer
+    local backend fps video_codec video_bitrate gsr_container frame_mode gsr_encoder fallback_cpu keyint gsr_verbose queue_size pipe_buffer use_pipe_buffer
+    local x264_preset x264_tune x264_profile x264_level keyframes capture_w capture_h capture_x capture_y display_name vaapi_device vaapi_filter
     local mic_source_raw system_source_raw mic_source system_source mic_gain system_gain audio_bitrate audio_rate
     local filter_complex
-    local -a gsr_args ffmpeg_args
+    local -a gsr_args ffmpeg_args stream_args
     local status
 
     check_dependencies
@@ -820,6 +854,50 @@ main() {
     thumbnail=$THUMBNAIL
     privacy=$PRIVACY
 
+    backend=${YOUTUBE_STREAM_CAPTURE_BACKEND:-$DEFAULT_CAPTURE_BACKEND}
+    fps=${YOUTUBE_STREAM_FPS:-${QUICKREC_FPS:-$DEFAULT_FPS}}
+    video_codec=${YOUTUBE_STREAM_VIDEO_CODEC:-h264}
+    video_bitrate=${YOUTUBE_STREAM_VIDEO_BITRATE_KBPS:-$DEFAULT_VIDEO_BITRATE_KBPS}
+    x264_preset=${YOUTUBE_STREAM_X264_PRESET:-$DEFAULT_X264_PRESET}
+    x264_tune=${YOUTUBE_STREAM_X264_TUNE:-$DEFAULT_X264_TUNE}
+    x264_profile=${YOUTUBE_STREAM_X264_PROFILE:-$DEFAULT_X264_PROFILE}
+    x264_level=${YOUTUBE_STREAM_X264_LEVEL:-$DEFAULT_X264_LEVEL}
+    gsr_container=${YOUTUBE_STREAM_GSR_CONTAINER:-$DEFAULT_GSR_CONTAINER}
+    frame_mode=${YOUTUBE_STREAM_FRAME_MODE:-$DEFAULT_FRAME_MODE}
+    gsr_encoder=${YOUTUBE_STREAM_ENCODER:-gpu}
+    fallback_cpu=${YOUTUBE_STREAM_FALLBACK_CPU_ENCODING:-yes}
+    keyint=${YOUTUBE_STREAM_KEYINT:-2}
+    gsr_verbose=${YOUTUBE_STREAM_GSR_VERBOSE:-no}
+    queue_size=${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-$DEFAULT_THREAD_QUEUE_SIZE}
+    pipe_buffer=${YOUTUBE_STREAM_PIPE_BUFFER:-$DEFAULT_PIPE_BUFFER}
+    keyframes=${YOUTUBE_STREAM_KEYINT_FRAMES:-$((fps * keyint))}
+    vaapi_device=${YOUTUBE_STREAM_VAAPI_DEVICE:-/dev/dri/renderD128}
+    vaapi_filter=${YOUTUBE_STREAM_VAAPI_FILTER:-scale=1280:-2,format=nv12,hwupload}
+    use_pipe_buffer=0
+
+    case $backend in
+        ffmpeg-x11-x264|x264|ffmpeg-x264) ;;
+        ffmpeg-x11-vaapi|vaapi|ffmpeg-vaapi)
+            [[ -e $vaapi_device ]] || die "VAAPI device not found: $vaapi_device"
+            ;;
+        gsr|gpu-screen-recorder)
+            require_command gpu-screen-recorder
+            case ${pipe_buffer,,} in
+                ""|0|no|false|off|none) ;;
+                *)
+                    if have pv; then
+                        use_pipe_buffer=1
+                    else
+                        warn "pv not found; continuing without the extra video pipe buffer"
+                    fi
+                    ;;
+            esac
+            ;;
+        *)
+            die "unknown capture backend: $backend (use ffmpeg-x11-x264, ffmpeg-x11-vaapi, or gsr)"
+            ;;
+    esac
+
     if (( ! DRY_RUN )); then
         apply_youtube_metadata_api "$title" "$description" "$thumbnail" "$privacy"
     fi
@@ -829,55 +907,14 @@ main() {
 
     read -r monitor geometry < <(get_primary_monitor) || die "could not determine primary monitor with xrandr"
 
-    fps=${YOUTUBE_STREAM_FPS:-${QUICKREC_FPS:-$DEFAULT_FPS}}
-    video_codec=${YOUTUBE_STREAM_VIDEO_CODEC:-h264}
-    video_bitrate=${YOUTUBE_STREAM_VIDEO_BITRATE_KBPS:-$DEFAULT_VIDEO_BITRATE_KBPS}
-    gsr_container=${YOUTUBE_STREAM_GSR_CONTAINER:-$DEFAULT_GSR_CONTAINER}
-    frame_mode=${YOUTUBE_STREAM_FRAME_MODE:-$DEFAULT_FRAME_MODE}
-    gsr_encoder=${YOUTUBE_STREAM_ENCODER:-gpu}
-    fallback_cpu=${YOUTUBE_STREAM_FALLBACK_CPU_ENCODING:-yes}
-    keyint=${YOUTUBE_STREAM_KEYINT:-2}
-    gsr_verbose=${YOUTUBE_STREAM_GSR_VERBOSE:-no}
-    queue_size=${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-$DEFAULT_THREAD_QUEUE_SIZE}
-    pipe_buffer=${YOUTUBE_STREAM_PIPE_BUFFER:-$DEFAULT_PIPE_BUFFER}
-    use_pipe_buffer=0
-    case ${pipe_buffer,,} in
-        ""|0|no|false|off|none) ;;
-        *)
-            if have pv; then
-                use_pipe_buffer=1
-            else
-                warn "pv not found; continuing without the extra video pipe buffer"
-            fi
-            ;;
-    esac
-
-    gsr_args=(
-        gpu-screen-recorder
-        -w "$monitor"
-        -f "$fps"
-        -c "$gsr_container"
-        -fm "$frame_mode"
-        -k "$video_codec"
-        -bm cbr
-        -q "$video_bitrate"
-        -cursor yes
-        -keyint "$keyint"
-        -encoder "$gsr_encoder"
-        -fallback-cpu-encoding "$fallback_cpu"
-        -v "$gsr_verbose"
-        -o /dev/stdout
-    )
-
-    ffmpeg_args=(
-        ffmpeg
-        -hide_banner
-        -loglevel "${YOUTUBE_STREAM_FFMPEG_LOGLEVEL:-info}"
-        -nostdin
-        -thread_queue_size "$queue_size"
-        -i pipe:0
-    )
-
+    if [[ ! $geometry =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]]; then
+        die "could not parse monitor geometry: $geometry"
+    fi
+    capture_w=${BASH_REMATCH[1]}
+    capture_h=${BASH_REMATCH[2]}
+    capture_x=${BASH_REMATCH[3]}
+    capture_y=${BASH_REMATCH[4]}
+    display_name=${DISPLAY:-:0}
     if ((START_AUDIO)); then
         mic_source_raw=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_MIC_SOURCE QUICKREC_MIC_SOURCE "$DEFAULT_MIC_SOURCE")
         system_source_raw=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_SYSTEM_SOURCE QUICKREC_SYSTEM_SOURCE "$DEFAULT_SYSTEM_SOURCE")
@@ -887,43 +924,209 @@ main() {
         system_gain=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_SYSTEM_GAIN QUICKREC_SYSTEM_GAIN "$DEFAULT_SYSTEM_GAIN")
         audio_bitrate=${YOUTUBE_STREAM_AUDIO_BITRATE:-$DEFAULT_AUDIO_BITRATE}
         audio_rate=${YOUTUBE_STREAM_AUDIO_RATE:-48000}
-
         filter_complex="[1:a:0]volume=${mic_gain},aresample=async=1:first_pts=0[mic];[2:a:0]volume=${system_gain},aresample=async=1:first_pts=0[system];[mic][system]amix=inputs=2:duration=longest:dropout_transition=0,aresample=async=1:first_pts=0[a]"
-        ffmpeg_args+=(
-            -thread_queue_size "$queue_size"
-            -f pulse
-            -i "$mic_source"
-            -thread_queue_size "$queue_size"
-            -f pulse
-            -i "$system_source"
-            -filter_complex "$filter_complex"
-            -map 0:v:0
-            -map '[a]'
-            -c:v copy
-            -c:a aac
-            -b:a "$audio_bitrate"
-            -ac 2
-            -ar "$audio_rate"
-        )
-    else
-        ffmpeg_args+=(
-            -map 0:v:0
-            -c:v copy
-            -an
-        )
     fi
 
-    ffmpeg_args+=(
-        -flvflags no_duration_filesize
-        -f flv
-        "$stream_url"
-    )
+    case $backend in
+        ffmpeg-x11-x264|x264|ffmpeg-x264)
+            stream_args=(
+                ffmpeg
+                -hide_banner
+                -loglevel "${YOUTUBE_STREAM_FFMPEG_LOGLEVEL:-info}"
+                -stats_period "${YOUTUBE_STREAM_FFMPEG_STATS_PERIOD:-1}"
+                -nostdin
+                -thread_queue_size "$queue_size"
+                -f x11grab
+                -draw_mouse 1
+                -framerate "$fps"
+                -video_size "${capture_w}x${capture_h}"
+                -i "${display_name}+${capture_x},${capture_y}"
+            )
+            if ((START_AUDIO)); then
+                stream_args+=(
+                    -thread_queue_size "$queue_size"
+                    -f pulse
+                    -i "$mic_source"
+                    -thread_queue_size "$queue_size"
+                    -f pulse
+                    -i "$system_source"
+                    -filter_complex "$filter_complex"
+                    -map 0:v:0
+                    -map '[a]'
+                )
+            else
+                stream_args+=(
+                    -map 0:v:0
+                    -an
+                )
+            fi
+            stream_args+=(
+                -c:v libx264
+                -preset "$x264_preset"
+                -tune "$x264_tune"
+                -profile:v "$x264_profile"
+                -level "$x264_level"
+                -pix_fmt yuv420p
+                -b:v "${video_bitrate}k"
+                -minrate "${video_bitrate}k"
+                -maxrate "${video_bitrate}k"
+                -bufsize "$((video_bitrate * 2))k"
+                -x264-params "nal-hrd=cbr:force-cfr=1:filler=1"
+                -g "$keyframes"
+                -keyint_min "$keyframes"
+                -sc_threshold 0
+                -bf 0
+                -r "$fps"
+            )
+            if ((START_AUDIO)); then
+                stream_args+=(
+                    -c:a aac
+                    -b:a "$audio_bitrate"
+                    -ac 2
+                    -ar "$audio_rate"
+                )
+            fi
+            stream_args+=(
+                -flvflags no_duration_filesize
+                -f flv
+                "$stream_url"
+            )
+            use_pipe_buffer=0
+            ;;
+        ffmpeg-x11-vaapi|vaapi|ffmpeg-vaapi)
+            [[ -e $vaapi_device ]] || die "VAAPI device not found: $vaapi_device"
+            stream_args=(
+                ffmpeg
+                -hide_banner
+                -loglevel "${YOUTUBE_STREAM_FFMPEG_LOGLEVEL:-info}"
+                -stats_period "${YOUTUBE_STREAM_FFMPEG_STATS_PERIOD:-1}"
+                -nostdin
+                -vaapi_device "$vaapi_device"
+                -thread_queue_size "$queue_size"
+                -f x11grab
+                -draw_mouse 1
+                -framerate "$fps"
+                -video_size "${capture_w}x${capture_h}"
+                -i "${display_name}+${capture_x},${capture_y}"
+            )
+            if ((START_AUDIO)); then
+                stream_args+=(
+                    -thread_queue_size "$queue_size"
+                    -f pulse
+                    -i "$mic_source"
+                    -thread_queue_size "$queue_size"
+                    -f pulse
+                    -i "$system_source"
+                    -filter_complex "$filter_complex"
+                    -map 0:v:0
+                    -map '[a]'
+                )
+            else
+                stream_args+=(
+                    -map 0:v:0
+                    -an
+                )
+            fi
+            stream_args+=(
+                -vf "$vaapi_filter"
+                -c:v h264_vaapi
+                -profile:v high
+                -level 4.0
+                -rc_mode CBR
+                -b:v "${video_bitrate}k"
+                -maxrate "${video_bitrate}k"
+                -bufsize "$((video_bitrate * 2))k"
+                -g "$keyframes"
+                -bf 0
+                -idr_interval 0
+                -aud 1
+            )
+            if ((START_AUDIO)); then
+                stream_args+=(
+                    -c:a aac
+                    -b:a "$audio_bitrate"
+                    -ac 2
+                    -ar "$audio_rate"
+                )
+            fi
+            stream_args+=(
+                -flvflags no_duration_filesize
+                -f flv
+                "$stream_url"
+            )
+            use_pipe_buffer=0
+            ;;
+        gsr|gpu-screen-recorder)
+            gsr_args=(
+                gpu-screen-recorder
+                -w "$monitor"
+                -f "$fps"
+                -c "$gsr_container"
+                -fm "$frame_mode"
+                -k "$video_codec"
+                -bm cbr
+                -q "$video_bitrate"
+                -cursor yes
+                -keyint "$keyint"
+                -encoder "$gsr_encoder"
+                -fallback-cpu-encoding "$fallback_cpu"
+                -v "$gsr_verbose"
+                -o /dev/stdout
+            )
 
+            ffmpeg_args=(
+                ffmpeg
+                -hide_banner
+                -loglevel "${YOUTUBE_STREAM_FFMPEG_LOGLEVEL:-info}"
+                -nostdin
+                -thread_queue_size "$queue_size"
+                -i pipe:0
+            )
+
+            if ((START_AUDIO)); then
+                ffmpeg_args+=(
+                    -thread_queue_size "$queue_size"
+                    -f pulse
+                    -i "$mic_source"
+                    -thread_queue_size "$queue_size"
+                    -f pulse
+                    -i "$system_source"
+                    -filter_complex "$filter_complex"
+                    -map 0:v:0
+                    -map '[a]'
+                    -c:v copy
+                    -c:a aac
+                    -b:a "$audio_bitrate"
+                    -ac 2
+                    -ar "$audio_rate"
+                )
+            else
+                ffmpeg_args+=(
+                    -map 0:v:0
+                    -c:v copy
+                    -an
+                )
+            fi
+
+            ffmpeg_args+=(
+                -flvflags no_duration_filesize
+                -f flv
+                "$stream_url"
+            )
+            ;;
+        *)
+            die "unknown capture backend: $backend (use ffmpeg-x11-x264, ffmpeg-x11-vaapi, or gsr)"
+            ;;
+    esac
     if ((DRY_RUN)); then
-        printf 'title: %s\ndescription: %s\nthumbnail: %s\nprivacy: %s\nmonitor: %s\ngeometry: %s\nstream: %s\n' "$title" "$description" "$thumbnail" "${privacy:-unchanged}" "$monitor" "$geometry" "$redacted_url"
-        print_command gsr_args ffmpeg_args
-        if ((use_pipe_buffer)); then
-            printf 'VIDEO BUFFER: pv -q -B %q\n' "$pipe_buffer"
+        printf 'title: %s\ndescription: %s\nthumbnail: %s\nprivacy: %s\nbackend: %s\nmonitor: %s\ngeometry: %s\nstream: %s\n' "$title" "$description" "$thumbnail" "${privacy:-unchanged}" "$backend" "$monitor" "$geometry" "$redacted_url"
+        if [[ $backend == gsr || $backend == gpu-screen-recorder ]]; then
+            print_command gsr_args ffmpeg_args
+            if ((use_pipe_buffer)); then
+                printf 'VIDEO BUFFER: pv -q -B %q\n' "$pipe_buffer"
+            fi
+        else
+            print_single_command FFMPEG stream_args
         fi
         return 0
     fi
@@ -940,7 +1143,9 @@ main() {
     trap cleanup_stream EXIT
     trap on_interrupt INT TERM
 
-    enable_gpu_performance
+    if backend_uses_gpu "$backend"; then
+        enable_gpu_performance
+    fi
 
     if ((START_OUTLINE)); then
         outline_helper=$(find_outline_helper || true)
@@ -956,7 +1161,7 @@ main() {
     log "description: $description"
     log "thumbnail: $thumbnail"
     [[ -n $privacy ]] && log "privacy: $privacy"
-    log "capturing primary monitor: $monitor ($geometry), ${fps}fps ${frame_mode}, ${gsr_container} pipe"
+    log "capturing primary monitor: $monitor ($geometry), backend=$backend, ${fps}fps"
     if ((START_AUDIO)); then
         log "audio: mic=${mic_source:-?} gain=${mic_gain:-?}, system=${system_source:-?} gain=${system_gain:-?}"
     else
@@ -966,10 +1171,14 @@ main() {
     log "press Ctrl+C to stop"
 
     set +e
-    if ((use_pipe_buffer)); then
-        "${gsr_args[@]}" | pv -q -B "$pipe_buffer" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+    if [[ $backend == gsr || $backend == gpu-screen-recorder ]]; then
+        if ((use_pipe_buffer)); then
+            "${gsr_args[@]}" | pv -q -B "$pipe_buffer" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+        else
+            "${gsr_args[@]}" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+        fi
     else
-        "${gsr_args[@]}" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+        "${stream_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
     fi
     status=$?
     set -e
