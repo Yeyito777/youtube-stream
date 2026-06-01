@@ -113,6 +113,10 @@ def yt_put(path, params, token, body):
     return http_json("PUT", YOUTUBE_API + path + "?" + urllib.parse.urlencode(params), token, body=body)
 
 
+def yt_post(path, params, token, body):
+    return http_json("POST", YOUTUBE_API + path + "?" + urllib.parse.urlencode(params), token, body=body)
+
+
 def yt_post_upload(path, params, token, file_path):
     path_obj = pathlib.Path(file_path)
     mime = mimetypes.guess_type(path_obj.name)[0] or "application/octet-stream"
@@ -133,6 +137,70 @@ def yt_post_upload(path, params, token, file_path):
     )
 
 
+def list_broadcasts(token):
+    return yt_get("liveBroadcasts", {
+        "part": "id,snippet,status,contentDetails",
+        "mine": "true",
+        "maxResults": "25",
+    }, token).get("items", [])
+
+
+def choose_live_stream(token):
+    configured = os.environ.get("YOUTUBE_STREAM_ID") or os.environ.get("YOUTUBE_STREAM_LIVE_STREAM_ID")
+    if configured:
+        resp = yt_get("liveStreams", {"part": "id,snippet,cdn,status", "id": configured}, token)
+        items = resp.get("items", [])
+        if not items:
+            die(f"configured live stream id not found in authorized channel: {configured}")
+        return items[0]
+
+    resp = yt_get("liveStreams", {"part": "id,snippet,cdn,status", "mine": "true", "maxResults": "50"}, token)
+    items = resp.get("items", [])
+    if not items:
+        die("no YouTube Live stream key resource found; create one in YouTube Studio first")
+
+    def score(item):
+        title = item.get("snippet", {}).get("title", "")
+        status = item.get("status", {}).get("streamStatus", "")
+        return (
+            0 if "default" in title.lower() else 1,
+            0 if status in ("inactive", "ready", "active") else 1,
+            title,
+        )
+
+    items.sort(key=score)
+    return items[0]
+
+
+def create_broadcast(token, title, description, privacy):
+    scheduled = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 300))
+    stream = choose_live_stream(token)
+    body = {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "scheduledStartTime": scheduled,
+        },
+        "status": {
+            "privacyStatus": privacy,
+            "selfDeclaredMadeForKids": False,
+        },
+        "contentDetails": {
+            "enableAutoStart": True,
+            "enableAutoStop": True,
+            "enableDvr": True,
+            "latencyPreference": os.environ.get("YOUTUBE_STREAM_LATENCY", "low"),
+            "monitorStream": {"enableMonitorStream": True},
+        },
+    }
+    broadcast = yt_post("liveBroadcasts", {"part": "snippet,status,contentDetails"}, token, body)
+    return yt_post("liveBroadcasts/bind", {
+        "id": broadcast["id"],
+        "part": "id,snippet,status,contentDetails",
+        "streamId": stream["id"],
+    }, token, {})
+
+
 def choose_broadcast(items, requested_id=None):
     if requested_id:
         for item in items:
@@ -150,7 +218,7 @@ def choose_broadcast(items, requested_id=None):
     }
     usable = [item for item in items if item.get("status", {}).get("lifeCycleStatus") != "complete"]
     if not usable:
-        die("no non-complete YouTube Live broadcast found; create/reuse one in YouTube Studio first")
+        return None
     usable.sort(key=lambda item: (
         rank.get(item.get("status", {}).get("lifeCycleStatus"), 5),
         item.get("snippet", {}).get("scheduledStartTime", ""),
@@ -161,25 +229,29 @@ def choose_broadcast(items, requested_id=None):
 
 def update(args):
     token = access_token()
-    resp = yt_get("liveBroadcasts", {
-        "part": "id,snippet,status,contentDetails",
-        "mine": "true",
-        "maxResults": "25",
-    }, token)
-    item = choose_broadcast(resp.get("items", []), args.broadcast_id or os.environ.get("YOUTUBE_STREAM_BROADCAST_ID") or os.environ.get("YOUTUBE_STREAM_VIDEO_ID"))
+    privacy = args.privacy or "private"
+    requested_id = args.broadcast_id or os.environ.get("YOUTUBE_STREAM_BROADCAST_ID") or os.environ.get("YOUTUBE_STREAM_VIDEO_ID")
+    item = choose_broadcast(list_broadcasts(token), requested_id)
+    created = False
+    if item is None:
+        if requested_id:
+            die(f"configured broadcast/video id is complete and cannot be reused: {requested_id}")
+        item = create_broadcast(token, args.title, args.description, privacy)
+        created = True
+
     video_id = item["id"]
 
     parts = ["snippet"]
+    snippet = dict(item.get("snippet", {}))
+    snippet["title"] = args.title
+    snippet["description"] = args.description
     body = {
         "id": video_id,
-        "snippet": {
-            "title": args.title,
-            "description": args.description,
-        },
+        "snippet": snippet,
     }
-    if args.privacy:
+    if args.privacy or created:
         parts.append("status")
-        body["status"] = {"privacyStatus": args.privacy}
+        body["status"] = {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}
 
     updated = yt_put("liveBroadcasts", {"part": ",".join(parts)}, token, body)
     thumb_resp = yt_post_upload("thumbnails/set", {"videoId": video_id, "uploadType": "multipart"}, token, args.thumbnail)
@@ -189,9 +261,10 @@ def update(args):
         "watch_url": f"https://www.youtube.com/watch?v={video_id}",
         "title": updated.get("snippet", {}).get("title", args.title),
         "description": updated.get("snippet", {}).get("description", args.description),
-        "life_cycle_status": item.get("status", {}).get("lifeCycleStatus"),
+        "life_cycle_status": updated.get("status", item.get("status", {})).get("lifeCycleStatus"),
         "privacy_status": updated.get("status", item.get("status", {})).get("privacyStatus"),
         "thumbnail_updated": bool(thumb_resp.get("items")),
+        "created_broadcast": created,
     }
     print(json.dumps(out, ensure_ascii=False))
 

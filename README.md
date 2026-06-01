@@ -99,10 +99,11 @@ youtube-stream \
   -p /path/to/thumbnail.png
 ```
 
-Before starting the encoder, `youtube-stream` uses the YouTube Data API to set
-the title, description, optional privacy, and thumbnail on the current
-non-complete Live broadcast. It then opens the public watch page in vimbrowser
-unless `--no-browser` is passed.
+Before starting the encoder, `youtube-stream` uses the YouTube Data API to find
+the current non-complete Live broadcast, or create/bind a new one to your default
+stream key if the previous broadcast has already completed. It then sets the
+title, description, optional privacy, and thumbnail, and opens the public watch
+page in vimbrowser unless `--no-browser` is passed.
 
 Press `Ctrl+C` in the launching terminal to stop the stream.
 
@@ -172,6 +173,7 @@ system gain: 0.675
 ## Notes
 
 - `gpu-screen-recorder` does the screen capture and video encoding. `ffmpeg` receives the already encoded H.264 video, captures/mixes PulseAudio/PipeWire audio live, AAC-encodes the mixed audio, and muxes/pushes RTMP.
+- If the previous broadcast has completed, the API helper creates a fresh Live broadcast and binds it to your existing/default stream key before starting the encoder push.
 - YouTube may still require the Studio stream to have auto-start enabled, or you may need to click **Go live** after the stream preview appears. This tool updates title/description/thumbnail metadata through the YouTube Data API, opens the public watch page, and starts the encoder push; it does not force-click destructive YouTube Studio actions by default.
 
 ## Dependencies
