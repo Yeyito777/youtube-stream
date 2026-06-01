@@ -16,9 +16,13 @@ YOUTUBE_STREAM_RTMP_BASE=rtmp://a.rtmp.youtube.com/live2
 YOUTUBE_STREAM_FPS=30
 YOUTUBE_STREAM_VIDEO_CODEC=h264
 YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
+# flv + cfr keeps the live pipe steady; mkv/vfr can introduce periodic stalls.
+YOUTUBE_STREAM_GSR_CONTAINER=flv
+YOUTUBE_STREAM_FRAME_MODE=cfr
 YOUTUBE_STREAM_ENCODER=gpu
 YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=yes
 YOUTUBE_STREAM_KEYINT=2
+YOUTUBE_STREAM_THREAD_QUEUE_SIZE=4096
 
 # Audio. Defaults mirror quickrec: default mic + default system audio,
 # then live ffmpeg volume/amix with quickrec's gains.

@@ -12,6 +12,9 @@ DEFAULT_MIC_GAIN=10.5
 DEFAULT_SYSTEM_GAIN=0.675
 DEFAULT_AUDIO_BITRATE=192k
 DEFAULT_VIDEO_BITRATE_KBPS=6800
+DEFAULT_GSR_CONTAINER=flv
+DEFAULT_FRAME_MODE=cfr
+DEFAULT_THREAD_QUEUE_SIZE=4096
 DEFAULT_MIC_SOURCE=default_input
 DEFAULT_SYSTEM_SOURCE=default_output
 
@@ -61,6 +64,8 @@ Common config/env values:
   YOUTUBE_STREAM_PRIVACY=public
   YOUTUBE_STREAM_FPS=30
   YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
+  YOUTUBE_STREAM_GSR_CONTAINER=flv
+  YOUTUBE_STREAM_FRAME_MODE=cfr
   YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
   YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
   YOUTUBE_STREAM_MIC_GAIN=10.5
@@ -69,8 +74,9 @@ Common config/env values:
 Notes:
   - Audio defaults mirror quickrec's intent: mic + system audio mixed with
     boosted mic gain (10.5), system gain 0.675, and AAC 192k.
-  - Capture/encoding uses gpu-screen-recorder and the GPU. ffmpeg only muxes
-    the already-encoded video with the live mixed audio and pushes FLV/RTMP.
+  - Capture/encoding uses gpu-screen-recorder and the GPU in constant-frame-rate
+    mode. ffmpeg only muxes the already-encoded video with live mixed audio and
+    pushes low-latency FLV/RTMP.
 EOF
 }
 
@@ -740,7 +746,7 @@ on_interrupt() {
 
 main() {
     local title description thumbnail privacy monitor geometry outline_helper stream_url redacted_url
-    local fps video_codec video_bitrate gsr_encoder fallback_cpu keyint gsr_verbose
+    local fps video_codec video_bitrate gsr_container frame_mode gsr_encoder fallback_cpu keyint gsr_verbose queue_size
     local mic_source_raw system_source_raw mic_source system_source mic_gain system_gain audio_bitrate audio_rate
     local filter_complex
     local -a gsr_args ffmpeg_args
@@ -774,16 +780,20 @@ main() {
     fps=${YOUTUBE_STREAM_FPS:-${QUICKREC_FPS:-$DEFAULT_FPS}}
     video_codec=${YOUTUBE_STREAM_VIDEO_CODEC:-h264}
     video_bitrate=${YOUTUBE_STREAM_VIDEO_BITRATE_KBPS:-$DEFAULT_VIDEO_BITRATE_KBPS}
+    gsr_container=${YOUTUBE_STREAM_GSR_CONTAINER:-$DEFAULT_GSR_CONTAINER}
+    frame_mode=${YOUTUBE_STREAM_FRAME_MODE:-$DEFAULT_FRAME_MODE}
     gsr_encoder=${YOUTUBE_STREAM_ENCODER:-gpu}
     fallback_cpu=${YOUTUBE_STREAM_FALLBACK_CPU_ENCODING:-yes}
     keyint=${YOUTUBE_STREAM_KEYINT:-2}
     gsr_verbose=${YOUTUBE_STREAM_GSR_VERBOSE:-no}
+    queue_size=${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-$DEFAULT_THREAD_QUEUE_SIZE}
 
     gsr_args=(
         gpu-screen-recorder
         -w "$monitor"
         -f "$fps"
-        -c mkv
+        -c "$gsr_container"
+        -fm "$frame_mode"
         -k "$video_codec"
         -bm cbr
         -q "$video_bitrate"
@@ -800,7 +810,7 @@ main() {
         -hide_banner
         -loglevel "${YOUTUBE_STREAM_FFMPEG_LOGLEVEL:-info}"
         -nostdin
-        -thread_queue_size "${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-1024}"
+        -thread_queue_size "$queue_size"
         -i pipe:0
     )
 
@@ -816,10 +826,10 @@ main() {
 
         filter_complex="[1:a:0]volume=${mic_gain},aresample=async=1:first_pts=0[mic];[2:a:0]volume=${system_gain},aresample=async=1:first_pts=0[system];[mic][system]amix=inputs=2:duration=longest:dropout_transition=0,aresample=async=1:first_pts=0[a]"
         ffmpeg_args+=(
-            -thread_queue_size "${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-1024}"
+            -thread_queue_size "$queue_size"
             -f pulse
             -i "$mic_source"
-            -thread_queue_size "${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-1024}"
+            -thread_queue_size "$queue_size"
             -f pulse
             -i "$system_source"
             -filter_complex "$filter_complex"
@@ -840,6 +850,10 @@ main() {
     fi
 
     ffmpeg_args+=(
+        -max_interleave_delta 0
+        -muxdelay 0
+        -muxpreload 0
+        -flush_packets 1
         -flvflags no_duration_filesize
         -f flv
         "$stream_url"
@@ -877,7 +891,7 @@ main() {
     log "description: $description"
     log "thumbnail: $thumbnail"
     [[ -n $privacy ]] && log "privacy: $privacy"
-    log "capturing primary monitor: $monitor ($geometry)"
+    log "capturing primary monitor: $monitor ($geometry), ${fps}fps ${frame_mode}, ${gsr_container} pipe"
     if ((START_AUDIO)); then
         log "audio: mic=${mic_source:-?} gain=${mic_gain:-?}, system=${system_source:-?} gain=${system_gain:-?}"
     else

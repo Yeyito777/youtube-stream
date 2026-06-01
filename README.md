@@ -154,8 +154,11 @@ Important defaults:
 YOUTUBE_STREAM_FPS=30
 YOUTUBE_STREAM_VIDEO_CODEC=h264
 YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
+YOUTUBE_STREAM_GSR_CONTAINER=flv
+YOUTUBE_STREAM_FRAME_MODE=cfr
 YOUTUBE_STREAM_ENCODER=gpu
 YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=yes
+YOUTUBE_STREAM_THREAD_QUEUE_SIZE=4096
 YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
 YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
 YOUTUBE_STREAM_MIC_GAIN=10.5
@@ -172,7 +175,7 @@ system gain: 0.675
 
 ## Notes
 
-- `gpu-screen-recorder` does the screen capture and video encoding. `ffmpeg` receives the already encoded H.264 video, captures/mixes PulseAudio/PipeWire audio live, AAC-encodes the mixed audio, and muxes/pushes RTMP.
+- `gpu-screen-recorder` does the screen capture and video encoding. The default live pipe is `flv` plus constant frame rate (`cfr`) to avoid Matroska/VFR burstiness and periodic playback stalls. `ffmpeg` receives the already encoded H.264 video, captures/mixes PulseAudio/PipeWire audio live, AAC-encodes the mixed audio, and muxes/pushes RTMP with low-latency muxing flags.
 - If the previous broadcast has completed, the API helper creates a fresh Live broadcast and binds it to your existing/default stream key before starting the encoder push.
 - On normal exit or `Ctrl+C`, the wrapper attempts to mark the active YouTube broadcast `complete` through the API so shutdown is deterministic instead of relying only on YouTube auto-stop.
 - YouTube may still require the Studio stream to have auto-start enabled, or you may need to click **Go live** after the stream preview appears. This tool updates title/description/thumbnail metadata through the YouTube Data API, opens the public watch page, and starts the encoder push; it does not force-click destructive YouTube Studio actions by default.
