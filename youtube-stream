@@ -25,6 +25,8 @@ DESCRIPTION=""
 THUMBNAIL=""
 PRIVACY=""
 STREAM_WATCH_URL=""
+STREAM_BROADCAST_ID=""
+STREAM_COMPLETED=0
 
 usage() {
     cat <<'EOF'
@@ -452,6 +454,8 @@ apply_youtube_metadata_api() {
 
     watch_url=$(json_string_field "$result" watch_url)
     STREAM_WATCH_URL=$watch_url
+    STREAM_BROADCAST_ID=$(json_string_field "$result" broadcast_id)
+    [[ -n $STREAM_BROADCAST_ID ]] || STREAM_BROADCAST_ID=$(json_string_field "$result" video_id)
     log "updated YouTube stream metadata through API"
 
     if [[ -n $watch_url ]]; then
@@ -708,9 +712,29 @@ cleanup_outline() {
     fi
 }
 
+complete_youtube_broadcast() {
+    local helper result
+    (( STREAM_COMPLETED == 0 )) || return 0
+    [[ -n ${STREAM_BROADCAST_ID:-} ]] || return 0
+    helper=$(find_api_helper || true)
+    [[ -n $helper ]] || return 0
+    STREAM_COMPLETED=1
+    log "marking YouTube broadcast complete: $STREAM_BROADCAST_ID"
+    result=$("$helper" complete --broadcast-id "$STREAM_BROADCAST_ID" 2>&1) || {
+        warn "failed to mark YouTube broadcast complete: $result"
+        return 0
+    }
+    log "YouTube broadcast complete"
+}
+
+cleanup_stream() {
+    cleanup_outline
+    complete_youtube_broadcast
+}
+
 on_interrupt() {
     printf '\n%s: stopping stream...\n' "$PROGRAM" >&2
-    cleanup_outline
+    cleanup_stream
     exit 130
 }
 
@@ -833,9 +857,10 @@ main() {
     printf '%s\n' "$thumbnail" >"$STATE_DIR/current-thumbnail"
     [[ -n $privacy ]] && printf '%s\n' "$privacy" >"$STATE_DIR/current-privacy"
     [[ -n $STREAM_WATCH_URL ]] && printf '%s\n' "$STREAM_WATCH_URL" >"$STATE_DIR/current-watch-url"
+    [[ -n $STREAM_BROADCAST_ID ]] && printf '%s\n' "$STREAM_BROADCAST_ID" >"$STATE_DIR/current-broadcast-id"
     printf '%s\n' "$monitor $geometry" >"$STATE_DIR/current-monitor"
 
-    trap cleanup_outline EXIT
+    trap cleanup_stream EXIT
     trap on_interrupt INT TERM
 
     if ((START_OUTLINE)); then
@@ -866,7 +891,7 @@ main() {
     status=$?
     set -e
 
-    cleanup_outline
+    cleanup_stream
     trap - EXIT INT TERM
 
     if ((status == 0)); then

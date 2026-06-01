@@ -105,7 +105,7 @@ stream key if the previous broadcast has already completed. It then sets the
 title, description, optional privacy, and thumbnail, and opens the public watch
 page in vimbrowser unless `--no-browser` is passed.
 
-Press `Ctrl+C` in the launching terminal to stop the stream.
+Press `Ctrl+C` in the launching terminal to stop the stream. On shutdown, the tool stops the local encoder and asks the YouTube Data API to transition the active broadcast to `complete`.
 
 ### Flags
 
@@ -174,6 +174,7 @@ system gain: 0.675
 
 - `gpu-screen-recorder` does the screen capture and video encoding. `ffmpeg` receives the already encoded H.264 video, captures/mixes PulseAudio/PipeWire audio live, AAC-encodes the mixed audio, and muxes/pushes RTMP.
 - If the previous broadcast has completed, the API helper creates a fresh Live broadcast and binds it to your existing/default stream key before starting the encoder push.
+- On normal exit or `Ctrl+C`, the wrapper attempts to mark the active YouTube broadcast `complete` through the API so shutdown is deterministic instead of relying only on YouTube auto-stop.
 - YouTube may still require the Studio stream to have auto-start enabled, or you may need to click **Go live** after the stream preview appears. This tool updates title/description/thumbnail metadata through the YouTube Data API, opens the public watch page, and starts the encoder push; it does not force-click destructive YouTube Studio actions by default.
 
 ## Dependencies

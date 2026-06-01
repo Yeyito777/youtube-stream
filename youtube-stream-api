@@ -257,6 +257,7 @@ def update(args):
     thumb_resp = yt_post_upload("thumbnails/set", {"videoId": video_id, "uploadType": "multipart"}, token, args.thumbnail)
 
     out = {
+        "broadcast_id": video_id,
         "video_id": video_id,
         "watch_url": f"https://www.youtube.com/watch?v={video_id}",
         "title": updated.get("snippet", {}).get("title", args.title),
@@ -269,9 +270,40 @@ def update(args):
     print(json.dumps(out, ensure_ascii=False))
 
 
+def complete(args):
+    token = access_token()
+    resp = yt_get("liveBroadcasts", {
+        "part": "id,status",
+        "id": args.broadcast_id,
+    }, token)
+    items = resp.get("items", [])
+    if not items:
+        die(f"broadcast not found: {args.broadcast_id}")
+    current_status = items[0].get("status", {}).get("lifeCycleStatus")
+    if current_status in ("complete", "created", "ready"):
+        print(json.dumps({
+            "broadcast_id": args.broadcast_id,
+            "life_cycle_status": current_status,
+            "transitioned": False,
+        }, ensure_ascii=False))
+        return
+
+    result = yt_post("liveBroadcasts/transition", {
+        "id": args.broadcast_id,
+        "broadcastStatus": "complete",
+        "part": "id,status",
+    }, token, {})
+    print(json.dumps({
+        "broadcast_id": result.get("id", args.broadcast_id),
+        "life_cycle_status": result.get("status", {}).get("lifeCycleStatus"),
+        "transitioned": True,
+    }, ensure_ascii=False))
+
+
 def main():
     parser = argparse.ArgumentParser(prog="youtube-stream-api")
     sub = parser.add_subparsers(dest="command", required=True)
+
     up = sub.add_parser("update", help="update title/description/thumbnail on the current YouTube Live broadcast")
     up.add_argument("--title", required=True)
     up.add_argument("--description", required=True)
@@ -279,6 +311,11 @@ def main():
     up.add_argument("--privacy", choices=["public", "unlisted", "private"])
     up.add_argument("--broadcast-id")
     up.set_defaults(func=update)
+
+    done = sub.add_parser("complete", help="transition a YouTube Live broadcast to complete")
+    done.add_argument("--broadcast-id", required=True)
+    done.set_defaults(func=complete)
+
     args = parser.parse_args()
     args.func(args)
 
