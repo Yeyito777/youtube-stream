@@ -8,7 +8,7 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/youtube-stream"
 
 # quickrec-compatible defaults:
 DEFAULT_FPS=30
-DEFAULT_MIC_GAIN=7.875
+DEFAULT_MIC_GAIN=10.5
 DEFAULT_SYSTEM_GAIN=0.675
 DEFAULT_AUDIO_BITRATE=192k
 DEFAULT_VIDEO_BITRATE_KBPS=6800
@@ -61,12 +61,12 @@ Common config/env values:
   YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=6800
   YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
   YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
-  YOUTUBE_STREAM_MIC_GAIN=7.875
+  YOUTUBE_STREAM_MIC_GAIN=10.5
   YOUTUBE_STREAM_SYSTEM_GAIN=0.675
 
 Notes:
   - Audio defaults mirror quickrec's intent: mic + system audio mixed with
-    quickrec's default gains (mic 7.875, system 0.675) and AAC 192k.
+    boosted mic gain (10.5), system gain 0.675, and AAC 192k.
   - Capture/encoding uses gpu-screen-recorder and the GPU. ffmpeg only muxes
     the already-encoded video with the live mixed audio and pushes FLV/RTMP.
 EOF

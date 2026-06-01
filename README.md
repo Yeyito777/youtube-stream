@@ -7,7 +7,7 @@ Simple YouTube Live streaming command for this workstation.
 1. requires a title, description, and thumbnail path before streaming,
 2. updates title/description/thumbnail through the YouTube Data API, then opens the public stream page,
 3. captures the X11 primary monitor with `gpu-screen-recorder` using GPU encoding,
-4. mixes microphone + system audio with the same gain defaults used by `quickrec`,
+4. mixes microphone + system audio with a boosted microphone gain,
 5. draws the same purple `#a855f7` click-through outline around the captured monitor style used by `active-development/record`,
 6. pushes FLV/RTMP to YouTube until you press `Ctrl+C` in the launching terminal.
 
@@ -157,15 +157,15 @@ YOUTUBE_STREAM_ENCODER=gpu
 YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=yes
 YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
 YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
-YOUTUBE_STREAM_MIC_GAIN=7.875
+YOUTUBE_STREAM_MIC_GAIN=10.5
 YOUTUBE_STREAM_SYSTEM_GAIN=0.675
 YOUTUBE_STREAM_AUDIO_BITRATE=192k
 ```
 
-The mic/system gain defaults are intentionally copied from `quickrec`:
+The mic gain is intentionally boosted so voice is louder relative to desktop audio:
 
 ```text
-mic gain:    7.875
+mic gain:    10.5
 system gain: 0.675
 ```
 
