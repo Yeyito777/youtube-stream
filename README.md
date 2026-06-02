@@ -9,7 +9,8 @@ Simple YouTube Live streaming command for this workstation.
 3. captures the X11 primary monitor with `gpu-screen-recorder`'s KMS/GPU path and streams H.264 directly to YouTube at 1080p60/12 Mbps,
 4. captures microphone + system audio into one AAC stream,
 5. draws the same purple `#a855f7` click-through outline around the captured monitor style used by `active-development/record`,
-6. pushes FLV/RTMP directly to YouTube until you press `Ctrl+C` in the launching terminal.
+6. opens a whale-themed stream-manager TUI with nvim-style controls for the audio gain sent to stream,
+7. pushes FLV/RTMP directly to YouTube until you press `q`/`Ctrl+C` in the launching terminal.
 
 ## Install
 
@@ -111,7 +112,29 @@ the selected encoder. It then sets the title, description, optional privacy, and
 thumbnail, and opens the public watch page in vimbrowser unless `--no-browser`
 is passed.
 
-Press `Ctrl+C` in the launching terminal to stop the stream. On shutdown, the tool stops the local encoder and asks the YouTube Data API to transition the active broadcast to `complete`.
+Press `q` in the stream-manager TUI, or `Ctrl+C` in the launching terminal, to
+stop the stream. On shutdown, the tool stops the local encoder and asks the
+YouTube Data API to transition the active broadcast to `complete`.
+
+Interactive terminals open the stream-manager TUI by default. It hides raw
+encoder output, shows stream/watch/status/capture info, and writes encoder logs
+to:
+
+```text
+~/.local/state/youtube-stream/current-encoder.log
+```
+
+TUI keys use nvim-style movement:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Select mic/system gain row. |
+| `h` / `l` | Decrease/increase selected gain by 5 percentage points. |
+| `H` / `L` | Decrease/increase selected gain by 25 percentage points. |
+| `0` | Mute selected stream gain. |
+| `=` | Reset selected stream gain to 100%. |
+| `r` | Reapply stream gains and refresh YouTube status/viewer info. |
+| `q` | Stop the stream cleanly. |
 
 ### Flags
 
@@ -125,6 +148,7 @@ Press `Ctrl+C` in the launching terminal to stop the stream. On shutdown, the to
 | `--no-browser` | Do not open the public watch page in vimbrowser. Metadata is still updated through the API. |
 | `--no-outline` | Do not draw the purple capture outline. |
 | `--no-audio` | Stream video only; disables microphone/system audio capture. |
+| `--no-tui` | Disable the stream-manager TUI and print logs directly. |
 | `--dry-run` | Print the encoder pipeline without updating YouTube metadata or starting the stream. |
 | `-h`, `--help` | Show command help. |
 
@@ -181,6 +205,8 @@ YOUTUBE_STREAM_PIPE_BUFFER=64m
 YOUTUBE_STREAM_GPU_PERF=high
 YOUTUBE_STREAM_ENCODER=gpu
 YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=no
+YOUTUBE_STREAM_TUI=1
+YOUTUBE_STREAM_TUI_STATUS_INTERVAL=15
 YOUTUBE_STREAM_THREAD_QUEUE_SIZE=4096
 YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
 YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
@@ -199,6 +225,7 @@ system gain: 0.675
 ## Notes
 
 - The default capture path is `gpu-screen-recorder` direct RTMP: KMS/GPU capture + GPU H.264 encode + FLV/RTMP output to YouTube in one process at 1080p60, CFR, and 12 Mbps CBR. This avoids the `ffmpeg x11grab` CPU-copy bottleneck and also avoids the older GSR→pipe→ffmpeg remux path.
+- The TUI gain controls adjust the PipeWire/PulseAudio source-output volumes for the stream capture (`gsr-default_output` and `gsr-default_input`). This changes what is sent to stream without changing your global desktop or mic volume.
 - The API helper defaults to `YOUTUBE_STREAM_CDN_RESOLUTION=1080p` and `YOUTUBE_STREAM_CDN_FRAME_RATE=60fps`, creates/reuses a matching Live Stream resource (`YOUTUBE_STREAM_CREATE_LIVE_STREAM=yes`), and returns that ingest URL to the wrapper. This matters: YouTube will not reliably expose an `hd1080`/60fps watch-page rendition if the bound Live Stream resource is only configured for a lower CDN profile.
 - The ffmpeg-only GPU backend remains available with `YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi`, but it still uses `x11grab`; on this workstation that path can keep the encoder busy while delivering too few unique captured frames, which looks like throttling.
 - The CPU fallback remains available with `YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264`; it uses `libx264` strict CBR (`nal-hrd=cbr:filler=1`), zero-latency tune, 2-second keyframes, High profile/level 4.2, and excellent text quality if the GPU backend regresses.
@@ -213,5 +240,6 @@ system gain: 0.675
 - `xrandr`
 - `vimbrowser-cli`
 - `gpu-screen-recorder` (default backend; required unless using `ffmpeg-x11-vaapi` or `ffmpeg-x11-x264`)
+- `pactl` (for TUI live audio gain controls)
 - `pv` (optional; only used for the GSR video pipe buffer)
 - X11 development libraries to build the outline helper (`libX11`, `libXext`)

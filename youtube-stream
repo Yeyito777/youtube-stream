@@ -35,6 +35,7 @@ DEFAULT_SYSTEM_SOURCE=default_output
 START_BROWSER=1
 START_OUTLINE=1
 START_AUDIO=1
+START_TUI=1
 DRY_RUN=0
 SETUP_ONLY=0
 TITLE=""
@@ -48,6 +49,31 @@ STREAM_COMPLETED=0
 GPU_PERF_PATH=""
 GPU_PERF_OLD=""
 GPU_PERF_SET=0
+STREAM_PID=""
+TUI_OLD_STTY=""
+TUI_LOG_FILE=""
+TUI_SELECTED=0
+TUI_STATUS="starting"
+TUI_VIEWERS="?"
+TUI_STATUS_UPDATED="never"
+TUI_MESSAGE=""
+
+# Exocortex whale theme colors (~/Workspace/exocortex/tui/src/themes/whale.ts).
+W_RESET=$'\033[0m'
+W_BOLD=$'\033[1m'
+W_DIM=$'\033[2m'
+W_ACCENT=$'\033[38;2;29;155;240m'
+W_TEXT=$'\033[38;2;255;255;255m'
+W_MUTED=$'\033[38;2;100;100;100m'
+W_SUCCESS=$'\033[38;2;80;200;120m'
+W_WARNING=$'\033[33m'
+W_ERROR=$'\033[31m'
+W_COMMAND=$'\033[38;2;174;214;254m'
+W_NORMAL=$'\033[38;2;72;202;228m'
+W_TOPBAR_BG=$'\033[48;2;29;155;240m'
+W_APP_BG=$'\033[48;2;0;5;15m'
+W_SIDEBAR_BG=$'\033[48;2;3;8;20m'
+W_SELECTION_BG=$'\033[48;2;79;82;88m'
 
 usage() {
     cat <<'EOF'
@@ -66,6 +92,7 @@ Options:
   --no-browser       Do not open the public stream page in vimbrowser
   --no-outline       Do not draw the purple primary-monitor outline
   --no-audio         Stream video only
+  --no-tui           Print logs directly instead of opening the stream manager TUI
   --dry-run          Print the command pipeline without starting it
   -h, --help         Show this help
 
@@ -99,6 +126,8 @@ Common config/env values:
   YOUTUBE_STREAM_FRAME_MODE=cfr
   YOUTUBE_STREAM_PIPE_BUFFER=64m
   YOUTUBE_STREAM_GPU_PERF=high
+  YOUTUBE_STREAM_TUI=1
+  YOUTUBE_STREAM_TUI_STATUS_INTERVAL=15
   YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
   YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
   YOUTUBE_STREAM_MIC_GAIN=10.5
@@ -188,6 +217,10 @@ while (($#)); do
             START_AUDIO=0
             shift
             ;;
+        --no-tui)
+            START_TUI=0
+            shift
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -216,6 +249,9 @@ TITLE=${TITLE:-${YOUTUBE_STREAM_TITLE:-}}
 DESCRIPTION=${DESCRIPTION:-${YOUTUBE_STREAM_DESCRIPTION:-}}
 THUMBNAIL=${THUMBNAIL:-${YOUTUBE_STREAM_THUMBNAIL:-}}
 PRIVACY=${PRIVACY:-${YOUTUBE_STREAM_PRIVACY:-}}
+case ${YOUTUBE_STREAM_TUI:-} in
+    0|no|No|NO|false|False|FALSE|off|Off|OFF) START_TUI=0 ;;
+esac
 
 require_command() {
     have "$1" || die "missing dependency: $1"
@@ -854,12 +890,283 @@ backend_uses_gpu() {
     esac
 }
 
+should_use_tui() {
+    (( START_TUI == 1 && DRY_RUN == 0 )) || return 1
+    [[ -t 0 && -t 1 ]] || return 1
+    [[ ${TERM:-} != dumb ]] || return 1
+}
+
+percent_from_gain() {
+    awk 'BEGIN { printf "%d", (ARGV[1] * 100) + 0.5 }' "${1:-1}"
+}
+
+gain_from_percent() {
+    awk 'BEGIN { printf "%.2f", ARGV[1] / 100 }' "${1:-100}"
+}
+
+clamp_percent() {
+    local value=$1
+    (( value < 0 )) && value=0
+    (( value > 1500 )) && value=1500
+    printf '%s\n' "$value"
+}
+
+source_output_ids_by_app() {
+    local app_name=$1
+    pactl list source-outputs 2>/dev/null | awk -v wanted="$app_name" '
+        /^Source Output #/ {
+            if (idx != "" && found) print idx
+            idx=$3; sub(/^#/, "", idx); found=0
+        }
+        /^[[:space:]]*(application.name|media.name) = / {
+            value=$0
+            sub(/^[[:space:]]*(application.name|media.name) = "/, "", value)
+            sub(/"$/, "", value)
+            if (value == wanted) found=1
+        }
+        END { if (idx != "" && found) print idx }
+    '
+}
+
+apply_source_output_gain_by_app() {
+    local app_name=$1 percent=$2 id count=0
+    while IFS= read -r id; do
+        [[ -n $id ]] || continue
+        pactl set-source-output-volume "$id" "${percent}%" >/dev/null 2>&1 || continue
+        ((count++)) || true
+    done < <(source_output_ids_by_app "$app_name")
+    (( count > 0 ))
+}
+
+apply_stream_gains() {
+    local backend=$1 missing=0
+    (( START_AUDIO == 1 )) || return 0
+    if is_gsr_direct_backend "$backend"; then
+        apply_source_output_gain_by_app "$gsr_system_app" "$system_gain_percent" || missing=1
+        apply_source_output_gain_by_app "$gsr_mic_app" "$mic_gain_percent" || missing=1
+        if (( missing == 0 )); then
+            TUI_MESSAGE="applied system $(gain_from_percent "$system_gain_percent")x / mic $(gain_from_percent "$mic_gain_percent")x"
+        else
+            TUI_MESSAGE="waiting for GSR audio source-outputs..."
+        fi
+    else
+        TUI_MESSAGE="live gain controls are only enabled for gsr-direct-rtmp"
+    fi
+}
+
+update_stream_status() {
+    local helper result viewers status now
+    [[ -n ${STREAM_BROADCAST_ID:-} ]] || return 0
+    helper=$(find_api_helper || true)
+    [[ -n $helper ]] || return 0
+    result=$("$helper" status --broadcast-id "$STREAM_BROADCAST_ID" 2>/dev/null || true)
+    [[ -n $result ]] || return 0
+    status=$(json_string_field "$result" life_cycle_status)
+    viewers=$(json_string_field "$result" concurrent_viewers)
+    [[ -n $status ]] && TUI_STATUS=$status
+    case $viewers in ""|None|null) TUI_VIEWERS="?" ;; *) TUI_VIEWERS=$viewers ;; esac
+    now=$(date +%H:%M:%S)
+    TUI_STATUS_UPDATED=$now
+}
+
+latest_capture_fps() {
+    [[ -n $TUI_LOG_FILE && -f $TUI_LOG_FILE ]] || return 0
+    awk '/update fps:/ { line=$0 } END { print line }' "$TUI_LOG_FILE" 2>/dev/null | tail -n 1
+}
+
+latest_encoder_log_line() {
+    [[ -n $TUI_LOG_FILE && -f $TUI_LOG_FILE ]] || return 0
+    grep -vE '^(update fps:|damage fps:)' "$TUI_LOG_FILE" 2>/dev/null | tail -n 1
+}
+
+tui_enter() {
+    TUI_OLD_STTY=$(stty -g 2>/dev/null || true)
+    printf '\033[?1049h\033[?25l\033[2J\033[H'
+    stty -echo -icanon time 0 min 0 2>/dev/null || true
+}
+
+tui_leave() {
+    [[ -n ${TUI_OLD_STTY:-} ]] || return 0
+    stty "$TUI_OLD_STTY" 2>/dev/null || true
+    TUI_OLD_STTY=""
+    printf '%b\033[?25h\033[?1049l%b' "$W_RESET" "$W_RESET"
+}
+
+tui_gain_bar() {
+    local percent=$1 width=${2:-34} max=1200 filled empty
+    (( percent > max )) && percent=$max
+    filled=$(( percent * width / max ))
+    (( filled < 0 )) && filled=0
+    (( filled > width )) && filled=$width
+    empty=$(( width - filled ))
+    printf '%b%*s%b%*s' "$W_ACCENT" "$filled" '' "$W_MUTED" "$empty" '' | tr ' ' '█'
+}
+
+tui_draw_gain_row() {
+    local row=$1 label=$2 percent=$3 selected=$4 marker bg reset_bar
+    marker=' '
+    bg=''
+    if (( selected == 1 )); then
+        marker='▶'
+        bg=$W_SELECTION_BG
+    fi
+    printf '%b%s %b%-11s%b %6s%%  %5sx  ' "$bg" "$marker" "$W_COMMAND" "$label" "$W_RESET$bg" "$percent" "$(gain_from_percent "$percent")"
+    reset_bar=$W_RESET$W_APP_BG
+    tui_gain_bar "$percent" 28
+    printf '%b\n' "$reset_bar"
+}
+
+tui_draw() {
+    local rows cols capture_line log_line selected_system selected_mic running_label
+    read -r rows cols < <(stty size 2>/dev/null || printf '24 80\n')
+    capture_line=$(latest_capture_fps)
+    log_line=$(latest_encoder_log_line)
+    if [[ -n ${STREAM_PID:-} ]] && kill -0 "$STREAM_PID" 2>/dev/null; then
+        running_label="RUNNING pid=$STREAM_PID"
+    else
+        running_label="STOPPED"
+    fi
+    selected_system=0; selected_mic=0
+    (( TUI_SELECTED == 0 )) && selected_system=1 || selected_mic=1
+
+    printf '%b\033[H\033[2J' "$W_APP_BG"
+    printf '%b%b youtube-stream manager %b%b whale %b%b %*s%b\n' "$W_TOPBAR_BG" "$W_BOLD" "$W_RESET" "$W_TOPBAR_BG" "$W_BOLD" "$running_label" "$(( cols > 40 ? cols - 40 : 1 ))" '' "$W_RESET"
+    printf '%b\n' "$W_APP_BG"
+    printf '%b%s%b\n' "$W_ACCENT$W_BOLD" "  Stream" "$W_RESET$W_APP_BG"
+    printf '  %-14s %b%s%b\n' "title:" "$W_TEXT" "$title" "$W_RESET$W_APP_BG"
+    printf '  %-14s %b%s%b\n' "watch:" "$W_COMMAND" "${STREAM_WATCH_URL:-?}" "$W_RESET$W_APP_BG"
+    printf '  %-14s %s @ %sfps, %skbps, %s\n' "backend:" "$backend" "$fps" "$video_bitrate" "$privacy"
+    printf '  %-14s %s  viewers: %s  updated: %s\n' "YouTube:" "$TUI_STATUS" "$TUI_VIEWERS" "$TUI_STATUS_UPDATED"
+    printf '  %-14s %s\n' "capture:" "${capture_line:-waiting for capture stats...}"
+    printf '%b\n' "$W_APP_BG"
+
+    printf '%b%s%b\n' "$W_ACCENT$W_BOLD" "  Live audio gain sent to stream" "$W_RESET$W_APP_BG"
+    tui_draw_gain_row 0 "system" "$system_gain_percent" "$selected_system"
+    tui_draw_gain_row 1 "mic" "$mic_gain_percent" "$selected_mic"
+    printf '%b\n' "$W_APP_BG"
+    printf '%b%s%b\n' "$W_ACCENT$W_BOLD" "  Keys" "$W_RESET$W_APP_BG"
+    printf '  %bj/k%b select   %bh/l%b ±5%%   %bH/L%b ±25%%   %b0%b mute selected   %b=%b 100%%   %br%b reapply   %bq%b stop\n' "$W_NORMAL" "$W_RESET$W_APP_BG" "$W_NORMAL" "$W_RESET$W_APP_BG" "$W_NORMAL" "$W_RESET$W_APP_BG" "$W_NORMAL" "$W_RESET$W_APP_BG" "$W_NORMAL" "$W_RESET$W_APP_BG" "$W_NORMAL" "$W_RESET$W_APP_BG" "$W_NORMAL" "$W_RESET$W_APP_BG"
+    printf '%b\n' "$W_APP_BG"
+    printf '  %-14s %b%s%b\n' "message:" "$W_SUCCESS" "${TUI_MESSAGE:-ready}" "$W_RESET$W_APP_BG"
+    printf '  %-14s %s\n' "encoder log:" "${log_line:-$TUI_LOG_FILE}"
+    printf '%b' "$W_RESET"
+}
+
+tui_adjust_selected_gain() {
+    local delta=$1 current
+    if (( TUI_SELECTED == 0 )); then
+        current=$(( system_gain_percent + delta ))
+        system_gain_percent=$(clamp_percent "$current")
+    else
+        current=$(( mic_gain_percent + delta ))
+        mic_gain_percent=$(clamp_percent "$current")
+    fi
+    apply_stream_gains "$backend" || true
+}
+
+tui_set_selected_gain() {
+    local value=$1
+    if (( TUI_SELECTED == 0 )); then
+        system_gain_percent=$(clamp_percent "$value")
+    else
+        mic_gain_percent=$(clamp_percent "$value")
+    fi
+    apply_stream_gains "$backend" || true
+}
+
+run_stream_pipeline_background() {
+    local backend=$1
+    : >"$TUI_LOG_FILE"
+    if is_gsr_direct_backend "$backend"; then
+        "${gsr_args[@]}" 2> >(redact_stream_urls_from_stderr >>"$TUI_LOG_FILE") &
+        STREAM_PID=$!
+    elif is_gsr_pipe_backend "$backend"; then
+        if ((use_pipe_buffer)); then
+            ("${gsr_args[@]}" 2> >(redact_stream_urls_from_stderr >>"$TUI_LOG_FILE") | pv -q -B "$pipe_buffer" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >>"$TUI_LOG_FILE")) &
+        else
+            ("${gsr_args[@]}" 2> >(redact_stream_urls_from_stderr >>"$TUI_LOG_FILE") | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >>"$TUI_LOG_FILE")) &
+        fi
+        STREAM_PID=$!
+    else
+        "${stream_args[@]}" 2> >(redact_stream_urls_from_stderr >>"$TUI_LOG_FILE") &
+        STREAM_PID=$!
+    fi
+}
+
+run_stream_pipeline_foreground() {
+    local backend=$1
+    if is_gsr_direct_backend "$backend"; then
+        "${gsr_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+    elif is_gsr_pipe_backend "$backend"; then
+        if ((use_pipe_buffer)); then
+            "${gsr_args[@]}" | pv -q -B "$pipe_buffer" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+        else
+            "${gsr_args[@]}" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+        fi
+    else
+        "${stream_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+    fi
+}
+
+run_stream_manager_tui() {
+    local backend=$1 key status next_status now
+    TUI_LOG_FILE="$STATE_DIR/current-encoder.log"
+    run_stream_pipeline_background "$backend"
+    sleep 1
+    apply_stream_gains "$backend" || true
+    update_stream_status || true
+    next_status=$(( $(date +%s) + ${YOUTUBE_STREAM_TUI_STATUS_INTERVAL:-15} ))
+
+    tui_enter
+    while kill -0 "$STREAM_PID" 2>/dev/null; do
+        now=$(date +%s)
+        if (( now >= next_status )); then
+            update_stream_status || true
+            next_status=$(( now + ${YOUTUBE_STREAM_TUI_STATUS_INTERVAL:-15} ))
+        fi
+        tui_draw
+        key=""
+        IFS= read -rsn1 -t 0.25 key || true
+        case "$key" in
+            q)
+                TUI_MESSAGE="stopping stream..."
+                tui_draw
+                kill -INT "$STREAM_PID" 2>/dev/null || true
+                break
+                ;;
+            k) (( TUI_SELECTED > 0 )) && ((TUI_SELECTED--)) ;;
+            j) (( TUI_SELECTED < 1 )) && ((TUI_SELECTED++)) ;;
+            h) tui_adjust_selected_gain -5 ;;
+            l) tui_adjust_selected_gain 5 ;;
+            H) tui_adjust_selected_gain -25 ;;
+            L) tui_adjust_selected_gain 25 ;;
+            0) tui_set_selected_gain 0 ;;
+            '=') tui_set_selected_gain 100 ;;
+            r) apply_stream_gains "$backend" || true; update_stream_status || true ;;
+        esac
+    done
+    wait "$STREAM_PID"
+    status=$?
+    STREAM_PID=""
+    tui_leave
+    return "$status"
+}
+
 cleanup_outline() {
     if [[ -n ${OUTLINE_PID:-} ]]; then
         kill "$OUTLINE_PID" >/dev/null 2>&1 || true
         wait "$OUTLINE_PID" >/dev/null 2>&1 || true
         OUTLINE_PID=""
     fi
+}
+
+stop_stream_process() {
+    [[ -n ${STREAM_PID:-} ]] || return 0
+    if kill -0 "$STREAM_PID" 2>/dev/null; then
+        kill -INT "$STREAM_PID" 2>/dev/null || true
+        wait "$STREAM_PID" >/dev/null 2>&1 || true
+    fi
+    STREAM_PID=""
 }
 
 complete_youtube_broadcast() {
@@ -878,6 +1185,7 @@ complete_youtube_broadcast() {
 }
 
 cleanup_stream() {
+    stop_stream_process
     cleanup_outline
     complete_youtube_broadcast
     restore_gpu_performance
@@ -885,6 +1193,7 @@ cleanup_stream() {
 
 on_interrupt() {
     printf '\n%s: stopping stream...\n' "$PROGRAM" >&2
+    tui_leave
     cleanup_stream
     exit 130
 }
@@ -894,7 +1203,7 @@ main() {
     local backend fps video_codec video_bitrate gsr_container frame_mode gsr_encoder fallback_cpu keyint gsr_verbose queue_size pipe_buffer use_pipe_buffer
     local x264_preset x264_tune x264_profile x264_level keyframes capture_w capture_h capture_x capture_y display_name
     local vaapi_device vaapi_filter vaapi_profile vaapi_level vaapi_rc_mode
-    local mic_source_raw system_source_raw mic_source system_source gsr_audio_source mic_gain system_gain audio_bitrate audio_rate
+    local mic_source_raw system_source_raw mic_source system_source gsr_audio_source gsr_system_app gsr_mic_app mic_gain system_gain system_gain_percent mic_gain_percent audio_bitrate audio_rate
     local filter_complex
     local -a gsr_args ffmpeg_args stream_args
     local status
@@ -1001,8 +1310,12 @@ main() {
         mic_source=$(to_pulse_source "$mic_source_raw")
         system_source=$(to_pulse_source "$system_source_raw")
         gsr_audio_source="$(to_gsr_audio_source "$system_source_raw")|$(to_gsr_audio_source "$mic_source_raw")"
+        gsr_system_app="gsr-$(to_gsr_audio_source "$system_source_raw")"
+        gsr_mic_app="gsr-$(to_gsr_audio_source "$mic_source_raw")"
         mic_gain=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_MIC_GAIN QUICKREC_MIC_GAIN "$DEFAULT_MIC_GAIN")
         system_gain=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_SYSTEM_GAIN QUICKREC_SYSTEM_GAIN "$DEFAULT_SYSTEM_GAIN")
+        mic_gain_percent=$(percent_from_gain "$mic_gain")
+        system_gain_percent=$(percent_from_gain "$system_gain")
         audio_bitrate=${YOUTUBE_STREAM_AUDIO_BITRATE:-$DEFAULT_AUDIO_BITRATE}
         audio_rate=${YOUTUBE_STREAM_AUDIO_RATE:-48000}
         filter_complex="[1:a:0]volume=${mic_gain},aresample=async=1:first_pts=0[mic];[2:a:0]volume=${system_gain},aresample=async=1:first_pts=0[system];[mic][system]amix=inputs=2:duration=longest:dropout_transition=0,aresample=async=1:first_pts=0[a]"
@@ -1287,19 +1600,17 @@ main() {
         log "audio: disabled"
     fi
     log "streaming to: $redacted_url"
-    log "press Ctrl+C to stop"
+    if should_use_tui; then
+        log "opening stream manager TUI; press q or Ctrl+C to stop"
+    else
+        log "press Ctrl+C to stop"
+    fi
 
     set +e
-    if is_gsr_direct_backend "$backend"; then
-        "${gsr_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
-    elif is_gsr_pipe_backend "$backend"; then
-        if ((use_pipe_buffer)); then
-            "${gsr_args[@]}" | pv -q -B "$pipe_buffer" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
-        else
-            "${gsr_args[@]}" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
-        fi
+    if should_use_tui; then
+        run_stream_manager_tui "$backend"
     else
-        "${stream_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+        run_stream_pipeline_foreground "$backend"
     fi
     status=$?
     set -e

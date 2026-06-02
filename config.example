@@ -63,6 +63,11 @@ YOUTUBE_STREAM_AUDIO_RATE=48000
 # the YouTube Data API metadata update succeeds.
 YOUTUBE_STREAM_BROWSER_WAIT=5
 
+# Stream-manager TUI. Enabled by default on interactive terminals. Use --no-tui
+# or YOUTUBE_STREAM_TUI=0 to keep raw encoder logs in the terminal.
+YOUTUBE_STREAM_TUI=1
+YOUTUBE_STREAM_TUI_STATUS_INTERVAL=15
+
 # Required to stream. You can set these here, but per-stream CLI args are usually better:
 #   youtube-stream -t 'Title' -d 'Description' -p /path/to/thumbnail.png
 # YOUTUBE_STREAM_TITLE='My stream title'

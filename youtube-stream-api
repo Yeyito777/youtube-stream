@@ -366,6 +366,38 @@ def complete(args):
     }, ensure_ascii=False))
 
 
+def status(args):
+    token = access_token()
+    broadcast_resp = yt_get("liveBroadcasts", {
+        "part": "id,snippet,status",
+        "id": args.broadcast_id,
+    }, token)
+    broadcast_items = broadcast_resp.get("items", [])
+    if not broadcast_items:
+        die(f"broadcast not found: {args.broadcast_id}")
+
+    video_resp = yt_get("videos", {
+        "part": "id,snippet,status,liveStreamingDetails,statistics",
+        "id": args.broadcast_id,
+    }, token)
+    video_items = video_resp.get("items", [])
+    video = video_items[0] if video_items else {}
+    broadcast = broadcast_items[0]
+    details = video.get("liveStreamingDetails", {})
+    stats = video.get("statistics", {})
+    print(json.dumps({
+        "broadcast_id": broadcast.get("id", args.broadcast_id),
+        "title": broadcast.get("snippet", {}).get("title") or video.get("snippet", {}).get("title"),
+        "life_cycle_status": broadcast.get("status", {}).get("lifeCycleStatus"),
+        "privacy_status": broadcast.get("status", {}).get("privacyStatus") or video.get("status", {}).get("privacyStatus"),
+        "actual_start_time": details.get("actualStartTime"),
+        "actual_end_time": details.get("actualEndTime"),
+        "concurrent_viewers": details.get("concurrentViewers"),
+        "view_count": stats.get("viewCount"),
+        "watch_url": f"https://www.youtube.com/watch?v={broadcast.get('id', args.broadcast_id)}",
+    }, ensure_ascii=False))
+
+
 def main():
     parser = argparse.ArgumentParser(prog="youtube-stream-api")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -381,6 +413,10 @@ def main():
     done = sub.add_parser("complete", help="transition a YouTube Live broadcast to complete")
     done.add_argument("--broadcast-id", required=True)
     done.set_defaults(func=complete)
+
+    st = sub.add_parser("status", help="show status/viewer info for a YouTube Live broadcast")
+    st.add_argument("--broadcast-id", required=True)
+    st.set_defaults(func=status)
 
     args = parser.parse_args()
     args.func(args)
