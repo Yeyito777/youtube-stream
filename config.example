@@ -25,39 +25,23 @@ YOUTUBE_STREAM_CREATE_LIVE_STREAM=yes
 YOUTUBE_STREAM_FPS=60
 YOUTUBE_STREAM_VIDEO_CODEC=h264
 YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=12000
-# Default is direct gpu-screen-recorder RTMP for no-copy-ish GPU capture at 1080p60.
-# Set to ffmpeg-x11-vaapi for the ffmpeg-only VAAPI path, ffmpeg-x11-x264 for
-# the CPU fallback, or gsr for the older gpu-screen-recorder + ffmpeg remuxing path.
+# C stream manager supports the known-good direct gpu-screen-recorder RTMP path.
 YOUTUBE_STREAM_CAPTURE_BACKEND=gsr-direct-rtmp
-YOUTUBE_STREAM_X264_PRESET=veryfast
-YOUTUBE_STREAM_X264_TUNE=zerolatency
-YOUTUBE_STREAM_X264_PROFILE=high
-YOUTUBE_STREAM_X264_LEVEL=4.2
-YOUTUBE_STREAM_VAAPI_DEVICE=/dev/dri/renderD128
-YOUTUBE_STREAM_VAAPI_FILTER=format=nv12,hwupload
-YOUTUBE_STREAM_VAAPI_PROFILE=high
-YOUTUBE_STREAM_VAAPI_LEVEL=4.2
-YOUTUBE_STREAM_VAAPI_RC_MODE=CBR
-# gpu-screen-recorder backend settings:
+# gpu-screen-recorder direct RTMP settings:
 YOUTUBE_STREAM_GSR_TUNE=quality
-YOUTUBE_STREAM_GSR_CONTAINER=mkv
-YOUTUBE_STREAM_FRAME_MODE=cfr
-YOUTUBE_STREAM_PIPE_BUFFER=64m
 # Best-effort for GPU backends only: keeps AMD GPU clocks from idling during capture; set auto/off to disable.
 YOUTUBE_STREAM_GPU_PERF=high
 YOUTUBE_STREAM_ENCODER=gpu
 YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=no
 YOUTUBE_STREAM_KEYINT=2
-YOUTUBE_STREAM_THREAD_QUEUE_SIZE=4096
 
-# Audio. Defaults mirror quickrec: default mic + default system audio,
-# then live ffmpeg volume/amix with quickrec's gains.
-YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
-YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
+# Audio. gpu-screen-recorder captures default mic + default system audio into one
+# AAC stream. The TUI adjusts only these stream source-output volumes.
+YOUTUBE_STREAM_MIC_SOURCE=default_input
+YOUTUBE_STREAM_SYSTEM_SOURCE=default_output
 YOUTUBE_STREAM_MIC_GAIN=10.5
 YOUTUBE_STREAM_SYSTEM_GAIN=0.675
 YOUTUBE_STREAM_AUDIO_BITRATE=192k
-YOUTUBE_STREAM_AUDIO_RATE=48000
 
 # Browser behavior. vimbrowser is only used to open the public watch page after
 # the YouTube Data API metadata update succeeds.
