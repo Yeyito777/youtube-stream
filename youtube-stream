@@ -830,9 +830,26 @@ restore_gpu_performance() {
     GPU_PERF_SET=0
 }
 
-backend_uses_gpu() {
+is_gsr_direct_backend() {
     case "$1" in
-        gsr-direct-rtmp|gsr-direct|gpu-screen-recorder-direct|gsr|gpu-screen-recorder|ffmpeg-x11-vaapi|vaapi|ffmpeg-vaapi) return 0 ;;
+        gsr-direct-rtmp|gsr-direct|gpu-screen-recorder-direct) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_gsr_pipe_backend() {
+    case "$1" in
+        gsr|gpu-screen-recorder) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+backend_uses_gpu() {
+    if is_gsr_direct_backend "$1" || is_gsr_pipe_backend "$1"; then
+        return 0
+    fi
+    case "$1" in
+        ffmpeg-x11-vaapi|vaapi|ffmpeg-vaapi) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -909,7 +926,14 @@ main() {
     gsr_container=${YOUTUBE_STREAM_GSR_CONTAINER:-$DEFAULT_GSR_CONTAINER}
     frame_mode=${YOUTUBE_STREAM_FRAME_MODE:-$DEFAULT_FRAME_MODE}
     gsr_encoder=${YOUTUBE_STREAM_ENCODER:-gpu}
-    fallback_cpu=${YOUTUBE_STREAM_FALLBACK_CPU_ENCODING:-yes}
+    fallback_cpu=${YOUTUBE_STREAM_FALLBACK_CPU_ENCODING:-}
+    if [[ -z $fallback_cpu ]]; then
+        if is_gsr_direct_backend "$backend"; then
+            fallback_cpu=no
+        else
+            fallback_cpu=yes
+        fi
+    fi
     keyint=${YOUTUBE_STREAM_KEYINT:-2}
     gsr_verbose=${YOUTUBE_STREAM_GSR_VERBOSE:-no}
     queue_size=${YOUTUBE_STREAM_THREAD_QUEUE_SIZE:-$DEFAULT_THREAD_QUEUE_SIZE}
@@ -1130,8 +1154,8 @@ main() {
                 -tune "${YOUTUBE_STREAM_GSR_TUNE:-quality}"
                 -cursor yes
                 -keyint "$keyint"
-                -encoder "${YOUTUBE_STREAM_ENCODER:-gpu}"
-                -fallback-cpu-encoding "${YOUTUBE_STREAM_FALLBACK_CPU_ENCODING:-no}"
+                -encoder "$gsr_encoder"
+                -fallback-cpu-encoding "$fallback_cpu"
             )
             if ((START_AUDIO)); then
                 gsr_args+=(
@@ -1209,9 +1233,9 @@ main() {
     esac
     if ((DRY_RUN)); then
         printf 'title: %s\ndescription: %s\nthumbnail: %s\nprivacy: %s\nbackend: %s\nmonitor: %s\ngeometry: %s\nstream: %s\n' "$title" "$description" "$thumbnail" "${privacy:-unchanged}" "$backend" "$monitor" "$geometry" "$redacted_url"
-        if [[ $backend == gsr-direct-rtmp || $backend == gsr-direct || $backend == gpu-screen-recorder-direct ]]; then
+        if is_gsr_direct_backend "$backend"; then
             print_single_command GSR gsr_args
-        elif [[ $backend == gsr || $backend == gpu-screen-recorder ]]; then
+        elif is_gsr_pipe_backend "$backend"; then
             print_command gsr_args ffmpeg_args
             if ((use_pipe_buffer)); then
                 printf 'VIDEO BUFFER: pv -q -B %q\n' "$pipe_buffer"
@@ -1254,7 +1278,7 @@ main() {
     [[ -n $privacy ]] && log "privacy: $privacy"
     log "capturing primary monitor: $monitor ($geometry), backend=$backend, ${fps}fps"
     if ((START_AUDIO)); then
-        if [[ $backend == gsr-direct-rtmp || $backend == gsr-direct || $backend == gpu-screen-recorder-direct ]]; then
+        if is_gsr_direct_backend "$backend"; then
             log "audio: gpu-screen-recorder source=${gsr_audio_source:-?} aac=${audio_bitrate:-?}"
         else
             log "audio: mic=${mic_source:-?} gain=${mic_gain:-?}, system=${system_source:-?} gain=${system_gain:-?}"
@@ -1266,9 +1290,9 @@ main() {
     log "press Ctrl+C to stop"
 
     set +e
-    if [[ $backend == gsr-direct-rtmp || $backend == gsr-direct || $backend == gpu-screen-recorder-direct ]]; then
+    if is_gsr_direct_backend "$backend"; then
         "${gsr_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
-    elif [[ $backend == gsr || $backend == gpu-screen-recorder ]]; then
+    elif is_gsr_pipe_backend "$backend"; then
         if ((use_pipe_buffer)); then
             "${gsr_args[@]}" | pv -q -B "$pipe_buffer" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
         else
