@@ -6,10 +6,10 @@ Simple YouTube Live streaming command for this workstation.
 
 1. requires a title, description, and thumbnail path before streaming,
 2. creates/reuses a 1080p60 YouTube Live Stream resource, updates title/description/thumbnail through the YouTube Data API, then opens the public stream page,
-3. captures the X11 primary monitor with `ffmpeg` and encodes H.264 on the GPU with VAAPI at 1080p60/12 Mbps,
-4. mixes microphone + system audio with a boosted microphone gain,
+3. captures the X11 primary monitor with `gpu-screen-recorder`'s KMS/GPU path and streams H.264 directly to YouTube at 1080p60/12 Mbps,
+4. captures microphone + system audio into one AAC stream,
 5. draws the same purple `#a855f7` click-through outline around the captured monitor style used by `active-development/record`,
-6. pushes FLV/RTMP directly from that `ffmpeg` process to YouTube until you press `Ctrl+C` in the launching terminal.
+6. pushes FLV/RTMP directly to YouTube until you press `Ctrl+C` in the launching terminal.
 
 ## Install
 
@@ -37,8 +37,8 @@ You need OAuth credentials for the YouTube account/channel in:
 
 With OAuth configured, the helper creates or reuses a YouTube Live Stream key
 resource whose CDN profile is `1080p` + `60fps`, then passes that ingest URL to
-`ffmpeg`. A manually configured `YOUTUBE_STREAM_KEY`/`YOUTUBE_STREAM_URL` is only
-needed as a fallback, for dry-runs, or if you disable API-created stream keys.
+the selected encoder. A manually configured `YOUTUBE_STREAM_KEY`/`YOUTUBE_STREAM_URL`
+is only needed as a fallback, for dry-runs, or if you disable API-created stream keys.
 
 Run:
 
@@ -107,8 +107,9 @@ youtube-stream \
 Before starting the encoder, `youtube-stream` uses the YouTube Data API to find
 or create a reusable 1080p60 Live Stream resource, find the current non-complete
 Live broadcast or create/bind a fresh one, and return the stream ingest URL for
-`ffmpeg`. It then sets the title, description, optional privacy, and thumbnail,
-and opens the public watch page in vimbrowser unless `--no-browser` is passed.
+the selected encoder. It then sets the title, description, optional privacy, and
+thumbnail, and opens the public watch page in vimbrowser unless `--no-browser`
+is passed.
 
 Press `Ctrl+C` in the launching terminal to stop the stream. On shutdown, the tool stops the local encoder and asks the YouTube Data API to transition the active broadcast to `complete`.
 
@@ -124,7 +125,7 @@ Press `Ctrl+C` in the launching terminal to stop the stream. On shutdown, the to
 | `--no-browser` | Do not open the public watch page in vimbrowser. Metadata is still updated through the API. |
 | `--no-outline` | Do not draw the purple capture outline. |
 | `--no-audio` | Stream video only; disables microphone/system audio capture. |
-| `--dry-run` | Print the ffmpeg pipeline without updating YouTube metadata or starting the stream. |
+| `--dry-run` | Print the encoder pipeline without updating YouTube metadata or starting the stream. |
 | `-h`, `--help` | Show command help. |
 
 ### Examples
@@ -159,7 +160,7 @@ Important defaults:
 YOUTUBE_STREAM_FPS=60
 YOUTUBE_STREAM_VIDEO_CODEC=h264
 YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=12000
-YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi
+YOUTUBE_STREAM_CAPTURE_BACKEND=gsr-direct-rtmp
 YOUTUBE_STREAM_CDN_RESOLUTION=1080p
 YOUTUBE_STREAM_CDN_FRAME_RATE=60fps
 YOUTUBE_STREAM_CREATE_LIVE_STREAM=yes
@@ -172,13 +173,14 @@ YOUTUBE_STREAM_VAAPI_FILTER=format=nv12,hwupload
 YOUTUBE_STREAM_VAAPI_PROFILE=high
 YOUTUBE_STREAM_VAAPI_LEVEL=4.2
 YOUTUBE_STREAM_VAAPI_RC_MODE=CBR
-# gpu-screen-recorder backend settings, if YOUTUBE_STREAM_CAPTURE_BACKEND=gsr:
+# gpu-screen-recorder backend settings:
+YOUTUBE_STREAM_GSR_TUNE=quality
 YOUTUBE_STREAM_GSR_CONTAINER=mkv
 YOUTUBE_STREAM_FRAME_MODE=cfr
 YOUTUBE_STREAM_PIPE_BUFFER=64m
 YOUTUBE_STREAM_GPU_PERF=high
 YOUTUBE_STREAM_ENCODER=gpu
-YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=yes
+YOUTUBE_STREAM_FALLBACK_CPU_ENCODING=no
 YOUTUBE_STREAM_THREAD_QUEUE_SIZE=4096
 YOUTUBE_STREAM_MIC_SOURCE=@DEFAULT_SOURCE@
 YOUTUBE_STREAM_SYSTEM_SOURCE=@DEFAULT_MONITOR@
@@ -187,7 +189,7 @@ YOUTUBE_STREAM_SYSTEM_GAIN=0.675
 YOUTUBE_STREAM_AUDIO_BITRATE=192k
 ```
 
-The mic gain is intentionally boosted so voice is louder relative to desktop audio:
+The ffmpeg backends intentionally boost mic gain so voice is louder relative to desktop audio:
 
 ```text
 mic gain:    10.5
@@ -196,8 +198,9 @@ system gain: 0.675
 
 ## Notes
 
-- The default capture path is a one-process `ffmpeg` pipeline using `x11grab` + `h264_vaapi` at 1080p60, High profile/level 4.2, CBR, and 12 Mbps video. It explicitly asks ffmpeg for CFR 60fps output and pushes directly to YouTube without GPU Screen Recorder, avoiding the GSR pipe/backpressure path that made the old stream buffer/chop.
+- The default capture path is `gpu-screen-recorder` direct RTMP: KMS/GPU capture + GPU H.264 encode + FLV/RTMP output to YouTube in one process at 1080p60, CFR, and 12 Mbps CBR. This avoids the `ffmpeg x11grab` CPU-copy bottleneck and also avoids the older GSR→pipe→ffmpeg remux path.
 - The API helper defaults to `YOUTUBE_STREAM_CDN_RESOLUTION=1080p` and `YOUTUBE_STREAM_CDN_FRAME_RATE=60fps`, creates/reuses a matching Live Stream resource (`YOUTUBE_STREAM_CREATE_LIVE_STREAM=yes`), and returns that ingest URL to the wrapper. This matters: YouTube will not reliably expose an `hd1080`/60fps watch-page rendition if the bound Live Stream resource is only configured for a lower CDN profile.
+- The ffmpeg-only GPU backend remains available with `YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi`, but it still uses `x11grab`; on this workstation that path can keep the encoder busy while delivering too few unique captured frames, which looks like throttling.
 - The CPU fallback remains available with `YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264`; it uses `libx264` strict CBR (`nal-hrd=cbr:filler=1`), zero-latency tune, 2-second keyframes, High profile/level 4.2, and excellent text quality if the GPU backend regresses.
 - The old GPU Screen Recorder path remains available with `YOUTUBE_STREAM_CAPTURE_BACKEND=gsr`. In that mode the live pipe is Matroska (`mkv`) with constant frame rate (`cfr`) timestamps plus a `pv` userspace pipe buffer. For GPU backends, the wrapper can best-effort pin the GPU performance level to `high` during capture, then restores the previous level on shutdown.
 - If the previous broadcast has completed, the API helper creates a fresh Live broadcast and binds it to the matching 1080p60 Live Stream resource before starting the encoder push.
@@ -209,6 +212,6 @@ system gain: 0.675
 - `ffmpeg`
 - `xrandr`
 - `vimbrowser-cli`
-- `gpu-screen-recorder` (optional; only needed for `YOUTUBE_STREAM_CAPTURE_BACKEND=gsr`)
+- `gpu-screen-recorder` (default backend; required unless using `ffmpeg-x11-vaapi` or `ffmpeg-x11-x264`)
 - `pv` (optional; only used for the GSR video pipe buffer)
 - X11 development libraries to build the outline helper (`libX11`, `libXext`)

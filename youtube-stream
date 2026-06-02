@@ -12,7 +12,7 @@ DEFAULT_MIC_GAIN=10.5
 DEFAULT_SYSTEM_GAIN=0.675
 DEFAULT_AUDIO_BITRATE=192k
 DEFAULT_VIDEO_BITRATE_KBPS=12000
-DEFAULT_CAPTURE_BACKEND=ffmpeg-x11-vaapi
+DEFAULT_CAPTURE_BACKEND=gsr-direct-rtmp
 DEFAULT_CDN_RESOLUTION=1080p
 DEFAULT_CDN_FRAME_RATE=60fps
 DEFAULT_X264_PRESET=veryfast
@@ -82,7 +82,7 @@ Common config/env values:
   YOUTUBE_STREAM_PRIVACY=public
   YOUTUBE_STREAM_FPS=60
   YOUTUBE_STREAM_VIDEO_BITRATE_KBPS=12000
-  YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi
+  YOUTUBE_STREAM_CAPTURE_BACKEND=gsr-direct-rtmp
   YOUTUBE_STREAM_CDN_RESOLUTION=1080p
   YOUTUBE_STREAM_CDN_FRAME_RATE=60fps
   YOUTUBE_STREAM_CREATE_LIVE_STREAM=yes
@@ -105,11 +105,12 @@ Common config/env values:
   YOUTUBE_STREAM_SYSTEM_GAIN=0.675
 
 Notes:
-  - Audio defaults mirror quickrec's intent: mic + system audio mixed with
-    boosted mic gain (10.5), system gain 0.675, and AAC 192k.
-  - Default capture/encoding uses one ffmpeg process: x11grab + h264_vaapi at
-    1080p60/12Mbps. Set YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-x264 for the
-    CPU fallback, or gsr for the older gpu-screen-recorder backend.
+  - Direct gpu-screen-recorder captures system + mic as one AAC stream. The
+    ffmpeg backends instead mix mic + system audio with quickrec-style gains.
+  - Default capture/encoding uses gpu-screen-recorder direct RTMP at
+    1080p60/12Mbps. Set YOUTUBE_STREAM_CAPTURE_BACKEND=ffmpeg-x11-vaapi for
+    the ffmpeg-only VAAPI path, ffmpeg-x11-x264 for CPU fallback, or gsr for
+    the older gpu-screen-recorder-to-ffmpeg pipe backend.
   - The API helper creates/reuses a YouTube Live Stream resource whose CDN
     profile defaults to 1080p/60fps so the watch page can expose hd1080@60.
 EOF
@@ -272,6 +273,15 @@ to_pulse_source() {
     case "$1" in
         default_input) printf '@DEFAULT_SOURCE@' ;;
         default_output) printf '@DEFAULT_MONITOR@' ;;
+        device:*) printf '%s' "${1#device:}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+to_gsr_audio_source() {
+    case "$1" in
+        @DEFAULT_SOURCE@) printf 'default_input' ;;
+        @DEFAULT_MONITOR@) printf 'default_output' ;;
         device:*) printf '%s' "${1#device:}" ;;
         *) printf '%s' "$1" ;;
     esac
@@ -822,7 +832,7 @@ restore_gpu_performance() {
 
 backend_uses_gpu() {
     case "$1" in
-        gsr|gpu-screen-recorder|ffmpeg-x11-vaapi|vaapi|ffmpeg-vaapi) return 0 ;;
+        gsr-direct-rtmp|gsr-direct|gpu-screen-recorder-direct|gsr|gpu-screen-recorder|ffmpeg-x11-vaapi|vaapi|ffmpeg-vaapi) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -867,7 +877,7 @@ main() {
     local backend fps video_codec video_bitrate gsr_container frame_mode gsr_encoder fallback_cpu keyint gsr_verbose queue_size pipe_buffer use_pipe_buffer
     local x264_preset x264_tune x264_profile x264_level keyframes capture_w capture_h capture_x capture_y display_name
     local vaapi_device vaapi_filter vaapi_profile vaapi_level vaapi_rc_mode
-    local mic_source_raw system_source_raw mic_source system_source mic_gain system_gain audio_bitrate audio_rate
+    local mic_source_raw system_source_raw mic_source system_source gsr_audio_source mic_gain system_gain audio_bitrate audio_rate
     local filter_complex
     local -a gsr_args ffmpeg_args stream_args
     local status
@@ -917,6 +927,9 @@ main() {
         ffmpeg-x11-vaapi|vaapi|ffmpeg-vaapi)
             [[ -e $vaapi_device ]] || die "VAAPI device not found: $vaapi_device"
             ;;
+        gsr-direct-rtmp|gsr-direct|gpu-screen-recorder-direct)
+            require_command gpu-screen-recorder
+            ;;
         gsr|gpu-screen-recorder)
             require_command gpu-screen-recorder
             case ${pipe_buffer,,} in
@@ -931,7 +944,7 @@ main() {
             esac
             ;;
         *)
-            die "unknown capture backend: $backend (use ffmpeg-x11-x264, ffmpeg-x11-vaapi, or gsr)"
+            die "unknown capture backend: $backend (use gsr-direct-rtmp, ffmpeg-x11-vaapi, ffmpeg-x11-x264, or gsr)"
             ;;
     esac
 
@@ -963,6 +976,7 @@ main() {
         system_source_raw=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_SYSTEM_SOURCE QUICKREC_SYSTEM_SOURCE "$DEFAULT_SYSTEM_SOURCE")
         mic_source=$(to_pulse_source "$mic_source_raw")
         system_source=$(to_pulse_source "$system_source_raw")
+        gsr_audio_source="$(to_gsr_audio_source "$system_source_raw")|$(to_gsr_audio_source "$mic_source_raw")"
         mic_gain=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_MIC_GAIN QUICKREC_MIC_GAIN "$DEFAULT_MIC_GAIN")
         system_gain=$(get_config_value_from_env_or_quickrec YOUTUBE_STREAM_SYSTEM_GAIN QUICKREC_SYSTEM_GAIN "$DEFAULT_SYSTEM_GAIN")
         audio_bitrate=${YOUTUBE_STREAM_AUDIO_BITRATE:-$DEFAULT_AUDIO_BITRATE}
@@ -1102,6 +1116,35 @@ main() {
             )
             use_pipe_buffer=0
             ;;
+        gsr-direct-rtmp|gsr-direct|gpu-screen-recorder-direct)
+            gsr_args=(
+                gpu-screen-recorder
+                -w "$monitor"
+                -f "$fps"
+                -s "${capture_w}x${capture_h}"
+                -c flv
+                -k "$video_codec"
+                -bm cbr
+                -q "$video_bitrate"
+                -fm cfr
+                -tune "${YOUTUBE_STREAM_GSR_TUNE:-quality}"
+                -cursor yes
+                -keyint "$keyint"
+                -encoder "${YOUTUBE_STREAM_ENCODER:-gpu}"
+                -fallback-cpu-encoding "${YOUTUBE_STREAM_FALLBACK_CPU_ENCODING:-no}"
+            )
+            if ((START_AUDIO)); then
+                gsr_args+=(
+                    -a "$gsr_audio_source"
+                    -ac aac
+                    -ab "${audio_bitrate%[kK]}"
+                )
+            fi
+            gsr_args+=(
+                -o "$stream_url"
+            )
+            use_pipe_buffer=0
+            ;;
         gsr|gpu-screen-recorder)
             gsr_args=(
                 gpu-screen-recorder
@@ -1161,12 +1204,14 @@ main() {
             )
             ;;
         *)
-            die "unknown capture backend: $backend (use ffmpeg-x11-x264, ffmpeg-x11-vaapi, or gsr)"
+            die "unknown capture backend: $backend (use gsr-direct-rtmp, ffmpeg-x11-vaapi, ffmpeg-x11-x264, or gsr)"
             ;;
     esac
     if ((DRY_RUN)); then
         printf 'title: %s\ndescription: %s\nthumbnail: %s\nprivacy: %s\nbackend: %s\nmonitor: %s\ngeometry: %s\nstream: %s\n' "$title" "$description" "$thumbnail" "${privacy:-unchanged}" "$backend" "$monitor" "$geometry" "$redacted_url"
-        if [[ $backend == gsr || $backend == gpu-screen-recorder ]]; then
+        if [[ $backend == gsr-direct-rtmp || $backend == gsr-direct || $backend == gpu-screen-recorder-direct ]]; then
+            print_single_command GSR gsr_args
+        elif [[ $backend == gsr || $backend == gpu-screen-recorder ]]; then
             print_command gsr_args ffmpeg_args
             if ((use_pipe_buffer)); then
                 printf 'VIDEO BUFFER: pv -q -B %q\n' "$pipe_buffer"
@@ -1209,7 +1254,11 @@ main() {
     [[ -n $privacy ]] && log "privacy: $privacy"
     log "capturing primary monitor: $monitor ($geometry), backend=$backend, ${fps}fps"
     if ((START_AUDIO)); then
-        log "audio: mic=${mic_source:-?} gain=${mic_gain:-?}, system=${system_source:-?} gain=${system_gain:-?}"
+        if [[ $backend == gsr-direct-rtmp || $backend == gsr-direct || $backend == gpu-screen-recorder-direct ]]; then
+            log "audio: gpu-screen-recorder source=${gsr_audio_source:-?} aac=${audio_bitrate:-?}"
+        else
+            log "audio: mic=${mic_source:-?} gain=${mic_gain:-?}, system=${system_source:-?} gain=${system_gain:-?}"
+        fi
     else
         log "audio: disabled"
     fi
@@ -1217,7 +1266,9 @@ main() {
     log "press Ctrl+C to stop"
 
     set +e
-    if [[ $backend == gsr || $backend == gpu-screen-recorder ]]; then
+    if [[ $backend == gsr-direct-rtmp || $backend == gsr-direct || $backend == gpu-screen-recorder-direct ]]; then
+        "${gsr_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
+    elif [[ $backend == gsr || $backend == gpu-screen-recorder ]]; then
         if ((use_pipe_buffer)); then
             "${gsr_args[@]}" | pv -q -B "$pipe_buffer" | "${ffmpeg_args[@]}" 2> >(redact_stream_urls_from_stderr >&2)
         else
